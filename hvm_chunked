@@ -1,0 +1,4421 @@
+./Collapse.hs
+#0:
+module HVML.Collapse where
+#1:
+import Control.Monad (ap, forM, forM_)
+import Control.Monad.IO.Class
+import Data.Char (chr, ord)
+import Data.IORef
+import Data.Word
+import GHC.Conc
+import HVML.Show
+import HVML.Type
+import System.Exit (exitFailure)
+import System.IO.Unsafe (unsafeInterleaveIO)
+import qualified Data.IntMap.Strict as IM
+import qualified Data.Map.Strict as MS
+import Debug.Trace
+#2:
+-- The Collapse Monad
+-- ------------------
+-- See: https://gist.github.com/VictorTaelin/60d3bc72fb4edefecd42095e44138b41
+#3:
+-- A bit-string
+data Bin
+  = O Bin
+  | I Bin
+  | E
+  deriving Show
+#4:
+-- A Collapse is a tree of superposed values
+data Collapse a = CSup Word64 (Collapse a) (Collapse a) | CVal a | CEra
+  deriving Show
+#5:
+bind :: Collapse a -> (a -> Collapse b) -> Collapse b
+bind k f = fork k IM.empty where
+  -- fork :: Collapse a -> IntMap (Bin -> Bin) -> Collapse b
+  fork CEra         paths = CEra
+  fork (CVal v)     paths = pass (f v) (IM.map (\x -> x E) paths)
+  fork (CSup k x y) paths =
+    let lft = fork x $ IM.alter (\x -> Just (maybe (putO id) putO x)) (fromIntegral k) paths in
+    let rgt = fork y $ IM.alter (\x -> Just (maybe (putI id) putI x)) (fromIntegral k) paths in
+    CSup k lft rgt 
+  -- pass :: Collapse b -> IntMap Bin -> Collapse b
+  pass CEra         paths = CEra
+  pass (CVal v)     paths = CVal v
+  pass (CSup k x y) paths = case IM.lookup (fromIntegral k) paths of
+    Just (O p) -> pass x (IM.insert (fromIntegral k) p paths)
+    Just (I p) -> pass y (IM.insert (fromIntegral k) p paths)
+    Just E     -> CSup k x y
+    Nothing    -> CSup k x y
+  -- putO :: (Bin -> Bin) -> (Bin -> Bin)
+  putO bs = \x -> bs (O x)
+  -- putI :: (Bin -> Bin) -> (Bin -> Bin) 
+  putI bs = \x -> bs (I x)
+#6:
+-- Mutates an element at given index in a list
+mut :: Word64 -> (a -> a) -> [a] -> [a]
+mut 0 f (x:xs) = f x : xs
+mut n f (x:xs) = x : mut (n-1) f xs
+mut _ _ []     = []
+#7:
+instance Functor Collapse where
+  fmap f (CVal v)     = CVal (f v)
+  fmap f (CSup k x y) = CSup k (fmap f x) (fmap f y)
+  fmap _ CEra         = CEra
+#8:
+instance Applicative Collapse where
+  pure  = CVal
+  (<*>) = ap
+#9:
+instance Monad Collapse where
+  return = pure
+  (>>=)  = bind
+#10:
+-- Dup Collapser
+-- -------------
+#11:
+collapseDupsAt :: IM.IntMap [Int] -> ReduceAt -> Book -> Loc -> HVM Core
+#12:
+collapseDupsAt state@(paths) reduceAt book host = unsafeInterleaveIO $ do
+  term <- reduceAt book host
+  case tagT (termTag term) of
+#13:
+    ERA -> do
+      return Era
+#14:
+    LET -> do
+      let loc = termLoc term
+      let mode = modeT (termLab term)
+      name <- return $ "$" ++ show (loc + 0)
+      val0 <- collapseDupsAt state reduceAt book (loc + 1)
+      bod0 <- collapseDupsAt state reduceAt book (loc + 2)
+      return $ Let mode name val0 bod0
+#15:
+    LAM -> do
+      let loc = termLoc term
+      name <- return $ "$" ++ show (loc + 0)
+      bod0 <- collapseDupsAt state reduceAt book (loc + 0)
+      return $ Lam name bod0
+#16:
+    APP -> do
+      let loc = termLoc term
+      fun0 <- collapseDupsAt state reduceAt book (loc + 0)
+      arg0 <- collapseDupsAt state reduceAt book (loc + 1)
+      return $ App fun0 arg0
+#17:
+    SUP -> do
+      let loc = termLoc term
+      let lab = termLab term
+      case IM.lookup (fromIntegral lab) paths of
+        Just (p:ps) -> do
+          let newPaths = IM.insert (fromIntegral lab) ps paths
+          collapseDupsAt (newPaths) reduceAt book (loc + fromIntegral p)
+        _ -> do
+          tm00 <- collapseDupsAt state reduceAt book (loc + 0)
+          tm11 <- collapseDupsAt state reduceAt book (loc + 1)
+          return $ Sup lab tm00 tm11
+#18:
+    VAR -> do
+      let loc = termLoc term
+      sub <- got loc
+      if termGetBit sub /= 0
+      then do
+        set (loc + 0) (termRemBit sub)
+        collapseDupsAt state reduceAt book (loc + 0)
+      else do
+        name <- return $ "$" ++ show loc
+        return $ Var name
+#19:
+    DP0 -> do
+      let loc = termLoc term
+      let lab = termLab term
+      sb0 <- got (loc+0)
+      if termGetBit sb0 /= 0
+      then do
+        set (loc + 0) (termRemBit sb0)
+        collapseDupsAt state reduceAt book (loc + 0)
+      else do
+        let newPaths = IM.alter (Just . maybe [0] (0:)) (fromIntegral lab) paths
+        collapseDupsAt (newPaths) reduceAt book (loc + 0)
+#20:
+    DP1 -> do
+      let loc = termLoc term
+      let lab = termLab term
+      sb1 <- got (loc+1)
+      if termGetBit sb1 /= 0
+      then do
+        set (loc + 1) (termRemBit sb1)
+        collapseDupsAt state reduceAt book (loc + 1)
+      else do
+        let newPaths = IM.alter (Just . maybe [1] (1:)) (fromIntegral lab) paths
+        collapseDupsAt (newPaths) reduceAt book (loc + 0)
+#21:
+    CTR -> do
+      let loc = termLoc term
+      let lab = termLab term
+      let cid = u12v2X lab
+      let ari = u12v2Y lab
+      let aux = if ari == 0 then [] else [loc + i | i <- [0..ari-1]]
+      fds0 <- forM aux (collapseDupsAt state reduceAt book)
+      return $ Ctr cid fds0
+#22:
+    MAT -> do
+      let loc = termLoc term
+      let len = u12v2X $ termLab term
+      let aux = if len == 0 then [] else [loc + 1 + i | i <- [0..len-1]]
+      val0 <- collapseDupsAt state reduceAt book (loc + 0)
+      css0 <- forM aux $ \h -> do
+        bod <- collapseDupsAt state reduceAt book h
+        return $ ("#", [], bod) -- TODO: recover constructor and fields
+      return $ Mat val0 [] css0
+#23:
+    W32 -> do
+      let val = termLoc term
+      return $ U32 (fromIntegral val)
+#24:
+    CHR -> do
+      let val = termLoc term
+      return $ Chr (chr (fromIntegral val))
+#25:
+    OPX -> do
+      let loc = termLoc term
+      let opr = toEnum (fromIntegral (termLab term))
+      nm00 <- collapseDupsAt state reduceAt book (loc + 0)
+      nm10 <- collapseDupsAt state reduceAt book (loc + 1)
+      return $ Op2 opr nm00 nm10
+#26:
+    OPY -> do
+      let loc = termLoc term
+      let opr = toEnum (fromIntegral (termLab term))
+      nm00 <- collapseDupsAt state reduceAt book (loc + 0)
+      nm10 <- collapseDupsAt state reduceAt book (loc + 1)
+      return $ Op2 opr nm00 nm10
+#27:
+    REF -> do
+      let loc = termLoc term
+      let lab = termLab term
+      let fid = u12v2X lab
+      let ari = u12v2Y lab
+      arg0 <- mapM (collapseDupsAt state reduceAt book) [loc + i | i <- [0..ari-1]]
+      let name = MS.findWithDefault "?" fid (idToName book)
+      return $ Ref name fid arg0
+#28:
+    tag -> do
+      putStrLn ("unexpected-tag:" ++ show tag)
+      return $ Var "?"
+      -- exitFailure
+#29:
+-- Sup Collapser
+-- -------------
+#30:
+collapseSups :: Book -> Core -> Collapse Core
+#31:
+collapseSups book core = case core of
+#32:
+  Var name -> do
+    return $ Var name
+#33:
+  Ref name fid args -> do
+    args <- mapM (collapseSups book) args
+    return $ Ref name fid args
+#34:
+  Lam name body -> do
+    body <- collapseSups book body
+    return $ Lam name body
+#35:
+  App fun arg -> do
+    fun <- collapseSups book fun
+    arg <- collapseSups book arg
+    return $ App fun arg
+#36:
+  Dup lab x y val body -> do
+    val <- collapseSups book val
+    body <- collapseSups book body
+    return $ Dup lab x y val body
+#37:
+  Ctr cid fields -> do
+    fields <- mapM (collapseSups book) fields
+    return $ Ctr cid fields
+#38:
+  Mat val mov css -> do
+    val <- collapseSups book val
+    mov <- mapM (\(key, expr) -> do
+      expr <- collapseSups book expr
+      return (key, expr)) mov
+    css <- mapM (\(ctr, fds, bod) -> do
+      bod <- collapseSups book bod
+      return (ctr, fds, bod)) css
+    return $ Mat val mov css
+#39:
+  U32 val -> do
+    return $ U32 val
+#40:
+  Chr val -> do
+    return $ Chr val
+#41:
+  Op2 op x y -> do
+    x <- collapseSups book x
+    y <- collapseSups book y
+    return $ Op2 op x y
+#42:
+  Let mode name val body -> do
+    val <- collapseSups book val
+    body <- collapseSups book body
+    return $ Let mode name val body
+#43:
+  Era -> do
+    CEra
+#44:
+  Sup lab tm0 tm1 -> do
+    let tm0' = collapseSups book tm0
+    let tm1' = collapseSups book tm1
+    CSup lab tm0' tm1'
+#45:
+-- Tree Collapser
+-- --------------
+#46:
+doCollapseAt :: ReduceAt -> Book -> Loc -> HVM (Collapse Core)
+doCollapseAt reduceAt book host = do
+  -- namesRef <- newIORef MS.empty
+  let state = (IM.empty)
+  core <- collapseDupsAt state reduceAt book host
+  return $ collapseSups book core
+#47:
+-- Priority Queue
+-- --------------
+#48:
+data PQ a
+  = PQLeaf
+  | PQNode (Word64, a) (PQ a) (PQ a)
+  deriving (Show)
+#49:
+pqUnion :: PQ a -> PQ a -> PQ a
+pqUnion PQLeaf heap = heap
+pqUnion heap PQLeaf = heap
+pqUnion heap1@(PQNode (k1,v1) l1 r1) heap2@(PQNode (k2,v2) l2 r2)
+  | k1 <= k2  = PQNode (k1,v1) (pqUnion heap2 r1) l1
+  | otherwise = PQNode (k2,v2) (pqUnion heap1 r2) l2
+#50:
+pqPop :: PQ a -> Maybe ((Word64, a), PQ a)
+pqPop PQLeaf         = Nothing
+pqPop (PQNode x l r) = Just (x, pqUnion l r)
+#51:
+pqPut :: (Word64,a) -> PQ a -> PQ a
+pqPut (k,v) = pqUnion (PQNode (k,v) PQLeaf PQLeaf)
+#52:
+-- Simple Queue
+-- ------------
+-- Allows pushing to an end, and popping from another.
+-- Simple purely functional implementation.
+-- Includes sqPop and sqPut.
+#53:
+data SQ a = SQ [a] [a]
+#54:
+sqPop :: SQ a -> Maybe (a, SQ a)
+sqPop (SQ [] [])     = Nothing
+sqPop (SQ [] ys)     = sqPop (SQ (reverse ys) [])
+sqPop (SQ (x:xs) ys) = Just (x, SQ xs ys)
+#55:
+sqPut :: a -> SQ a -> SQ a
+sqPut x (SQ xs ys) = SQ xs (x:ys)
+#56:
+-- Flattener
+-- ---------
+#57:
+flattenDFS :: Collapse a -> [a]
+flattenDFS (CSup k a b) = flatten a ++ flatten b
+flattenDFS (CVal x)     = [x]
+flattenDFS CEra         = []
+#58:
+flattenBFS :: Collapse a -> [a]
+flattenBFS term = go term (SQ [] [] :: SQ (Collapse a)) where
+  go (CSup k a b) sq = go CEra (sqPut b $ sqPut a $ sq)
+  go (CVal x)     sq = x : go CEra sq
+  go CEra         sq = case sqPop sq of
+    Just (v,sq) -> go v sq
+    Nothing     -> []
+#59:
+flattenPQ :: Collapse a -> [a]
+flattenPQ term = go term (PQLeaf :: PQ (Collapse a)) where
+  go (CSup k a b) pq = go CEra (pqPut (k,a) $ pqPut (k,b) $ pq)
+  go (CVal x)     pq = x : go CEra pq
+  go CEra         pq = case pqPop pq of
+    Just ((k,v),pq) -> go v pq
+    Nothing         -> []
+#60:
+flatten :: Collapse a -> [a]
+flatten = flattenBFS
+#61:
+-- Flat Collapser
+-- --------------
+#62:
+doCollapseFlatAt :: ReduceAt -> Book -> Loc -> HVM [Core]
+doCollapseFlatAt reduceAt book host = do
+  coll <- doCollapseAt reduceAt book host
+  return $ flatten coll
+./Compile.hs
+#63:
+#64:
+module HVML.Compile where
+#65:
+import Control.Monad (forM_, forM, foldM, when)
+import Control.Monad.State
+import Data.List
+import Data.Word
+import Debug.Trace
+import HVML.Show
+import HVML.Type hiding (fresh)
+import qualified Data.Map.Strict as MS
+#66:
+-- Compilation
+-- -----------
+#67:
+data CompileState = CompileState
+  { next :: Word64
+  , tabs :: Int
+  , bins :: MS.Map String String  -- var_name => binder_host
+  , vars :: [(String, String)]    -- [(var_name, var_host)]
+  , code :: [String]
+  }
+#68:
+type Compile = State CompileState
+#69:
+compile :: Book -> Word64 -> String
+compile book fid =
+  let full = compileWith compileFull book fid in
+  let fast = compileWith compileFast book fid in
+  let slow = compileWith compileSlow book fid in
+  if "<ERR>" `isInfixOf` fast
+    then unlines [ full , slow ]
+    else unlines [ full , fast ]
+#70:
+-- Compiles a function using either Fast-Mode or Full-Mode
+compileWith :: (Book -> Word64 -> Core -> Bool -> [(Bool,String)] -> Compile ()) -> Book -> Word64 -> String
+compileWith cmp book fid = 
+  let copy   = fst (fst (mget (idToFunc book) fid)) in
+  let args   = snd (fst (mget (idToFunc book) fid)) in
+  let core   = snd (mget (idToFunc book) fid) in
+  let state  = CompileState 0 0 MS.empty [] [] in
+  let result = runState (cmp book fid core copy args) state in
+  unlines $ reverse $ code (snd result)
+#71:
+emit :: String -> Compile ()
+emit line = modify $ \st -> st { code = (replicate (tabs st * 2) ' ' ++ line) : code st }
+#72:
+tabInc :: Compile ()
+tabInc = modify $ \st -> st { tabs = tabs st + 1 }
+#73:
+tabDec :: Compile ()
+tabDec = modify $ \st -> st { tabs = tabs st - 1 }
+#74:
+bind :: String -> String -> Compile ()
+bind var host = modify $ \st -> st { bins = MS.insert var host (bins st) }
+#75:
+fresh :: String -> Compile String
+fresh name = do
+  uid <- gets next
+  modify $ \s -> s { next = uid + 1 }
+  return $ name ++ show uid
+#76:
+-- Full Compiler
+-- -------------
+#77:
+compileFull :: Book -> Word64 -> Core -> Bool -> [(Bool,String)] -> Compile ()
+compileFull book fid core copy args = do
+  emit $ "Term " ++ mget (idToName book) fid ++ "_t(Term ref) {"
+  tabInc
+  forM_ (zip [0..] args) $ \(i, arg) -> do
+    let argName = snd arg
+    let argTerm = if fst arg
+          then "reduce_at(term_loc(ref) + " ++ show i ++ ")"
+          else "got(term_loc(ref) + " ++ show i ++ ")"
+    bind argName argTerm
+  result <- compileFullCore book fid core "root"
+  st <- get
+  forM_ (vars st) $ \ (var,host) -> do
+    let varTerm = MS.findWithDefault "" var (bins st)
+    emit $ "set(" ++ host ++ ", " ++ varTerm ++ ");"
+  emit $ "return " ++ result ++ ";"
+  tabDec
+  emit "}"
+#78:
+compileFullVar :: String -> String -> Compile String
+compileFullVar var host = do
+  bins <- gets bins
+  case MS.lookup var bins of
+    Just entry -> do
+      return entry
+    Nothing -> do
+      modify $ \s -> s { vars = (var, host) : vars s }
+      return "0"
+#79:
+compileFullCore :: Book -> Word64 -> Core -> String -> Compile String
+#80:
+compileFullCore book fid Era _ = do
+  return $ "term_new(ERA, 0, 0)"
+#81:
+compileFullCore book fid (Var name) host = do
+  compileFullVar name host
+#82:
+compileFullCore book fid (Let mode var val bod) host = do
+  letNam <- fresh "let"
+  emit $ "Loc " ++ letNam ++ " = alloc_node(2);"
+  -- emit $ "set(" ++ letNam ++ " + 0, term_new(SUB, 0, 0));"
+  valT <- compileFullCore book fid val (letNam ++ " + 0")
+  emit $ "set(" ++ letNam ++ " + 0, " ++ valT ++ ");"
+  bind var $ "term_new(VAR, 0, " ++ letNam ++ " + 0)"
+  bodT <- compileFullCore book fid bod (letNam ++ " + 1")
+  emit $ "set(" ++ letNam ++ " + 1, " ++ bodT ++ ");"
+  return $ "term_new(LET, " ++ show (fromEnum mode) ++ ", " ++ letNam ++ ")"
+#83:
+compileFullCore book fid (Lam var bod) host = do
+  lamNam <- fresh "lam"
+  emit $ "Loc " ++ lamNam ++ " = alloc_node(1);"
+  -- emit $ "set(" ++ lamNam ++ " + 0, term_new(SUB, 0, 0));"
+  bind var $ "term_new(VAR, 0, " ++ lamNam ++ " + 0)"
+  bodT <- compileFullCore book fid bod (lamNam ++ " + 0")
+  emit $ "set(" ++ lamNam ++ " + 0, " ++ bodT ++ ");"
+  return $ "term_new(LAM, 0, " ++ lamNam ++ ")"
+#84:
+compileFullCore book fid (App fun arg) host = do
+  appNam <- fresh "app"
+  emit $ "Loc " ++ appNam ++ " = alloc_node(2);"
+  funT <- compileFullCore book fid fun (appNam ++ " + 0")
+  argT <- compileFullCore book fid arg (appNam ++ " + 1")
+  emit $ "set(" ++ appNam ++ " + 0, " ++ funT ++ ");"
+  emit $ "set(" ++ appNam ++ " + 1, " ++ argT ++ ");"
+  return $ "term_new(APP, 0, " ++ appNam ++ ")"
+#85:
+compileFullCore book fid (Sup lab tm0 tm1) host = do
+  supNam <- fresh "sup"
+  emit $ "Loc " ++ supNam ++ " = alloc_node(2);"
+  tm0T <- compileFullCore book fid tm0 (supNam ++ " + 0")
+  tm1T <- compileFullCore book fid tm1 (supNam ++ " + 1")
+  emit $ "set(" ++ supNam ++ " + 0, " ++ tm0T ++ ");"
+  emit $ "set(" ++ supNam ++ " + 1, " ++ tm1T ++ ");"
+  return $ "term_new(SUP, " ++ show lab ++ ", " ++ supNam ++ ")"
+#86:
+compileFullCore book fid (Dup lab dp0 dp1 val bod) host = do
+  dupNam <- fresh "dup"
+  emit $ "Loc " ++ dupNam ++ " = alloc_node(2);"
+  emit $ "set(" ++ dupNam ++ " + 1, term_new(SUB, 0, 0));"
+  bind dp0 $ "term_new(DP0, " ++ show lab ++ ", " ++ dupNam ++ " + 0)"
+  bind dp1 $ "term_new(DP1, " ++ show lab ++ ", " ++ dupNam ++ " + 0)"
+  valT <- compileFullCore book fid val (dupNam ++ " + 0")
+  emit $ "set(" ++ dupNam ++ " + 0, " ++ valT ++ ");"
+  bodT <- compileFullCore book fid bod host
+  return bodT
+#87:
+compileFullCore book fid (Ctr cid fds) host = do
+  ctrNam <- fresh "ctr"
+  let arity = length fds
+  emit $ "Loc " ++ ctrNam ++ " = alloc_node(" ++ show arity ++ ");"
+  fdsT <- mapM (\ (i,fd) -> compileFullCore book fid fd (ctrNam ++ " + " ++ show i)) (zip [0..] fds)
+  sequence_ [emit $ "set(" ++ ctrNam ++ " + " ++ show i ++ ", " ++ fdT ++ ");" | (i,fdT) <- zip [0..] fdsT]
+  return $ "term_new(CTR, u12v2_new(" ++ show cid ++ ", " ++ show arity ++ "), " ++ ctrNam ++ ")"
+#88:
+compileFullCore book fid tm@(Mat val mov css) host = do
+  matNam <- fresh "mat"
+  let arity = length css
+  emit $ "Loc " ++ matNam ++ " = alloc_node(" ++ show (1 + arity) ++ ");"
+  valT <- compileFullCore book fid val (matNam ++ " + 0")
+  emit $ "set(" ++ matNam ++ " + 0, " ++ valT ++ ");"
+  forM_ (zip [0..] css) $ \ (i,(ctr,fds,bod)) -> do
+    -- Create a chain of lambdas for fields and moved vars
+    let bod' = foldr Lam (foldr Lam bod (map fst mov)) fds
+    bodT <- compileFullCore book fid bod' (matNam ++ " + " ++ show (i+1))
+    emit $ "set(" ++ matNam ++ " + " ++ show (i+1) ++ ", " ++ bodT ++ ");"
+  -- Create the base Mat term
+  let mat = "term_new(MAT, u12v2_new(" ++ show arity ++ "," ++ show (ifLetLab book tm) ++ "), " ++ matNam ++ ")"
+  -- Apply moved values
+  foldM (\term (key, val) -> do
+    appNam <- fresh "app"
+    emit $ "Loc " ++ appNam ++ " = alloc_node(2);"
+    valT <- compileFullCore book fid val (appNam ++ " + 1")
+    emit $ "set(" ++ appNam ++ " + 0, " ++ term ++ ");"
+    emit $ "set(" ++ appNam ++ " + 1, " ++ valT ++ ");"
+    return $ "term_new(APP, 0, " ++ appNam ++ ")"
+    ) mat mov
+#89:
+compileFullCore book fid (U32 val) _ =
+  return $ "term_new(W32, 0, " ++ show (fromIntegral val) ++ ")"
+#90:
+compileFullCore book fid (Chr val) _ =
+  return $ "term_new(CHR, 0, " ++ show (fromEnum val) ++ ")"
+#91:
+compileFullCore book fid (Op2 opr nu0 nu1) host = do
+  opxNam <- fresh "opx"
+  emit $ "Loc " ++ opxNam ++ " = alloc_node(2);"
+  nu0T <- compileFullCore book fid nu0 (opxNam ++ " + 0")
+  nu1T <- compileFullCore book fid nu1 (opxNam ++ " + 1")
+  emit $ "set(" ++ opxNam ++ " + 0, " ++ nu0T ++ ");"
+  emit $ "set(" ++ opxNam ++ " + 1, " ++ nu1T ++ ");"
+  return $ "term_new(OPX, " ++ show (fromEnum opr) ++ ", " ++ opxNam ++ ")"
+#92:
+compileFullCore book fid (Ref rNam rFid rArg) host = do
+  refNam <- fresh "ref"
+  let arity = length rArg
+  emit $ "Loc " ++ refNam ++ " = alloc_node(" ++ show arity ++ ");"
+  argsT <- mapM (\ (i,arg) -> compileFullCore book fid arg (refNam ++ " + " ++ show i)) (zip [0..] rArg)
+  sequence_ [emit $ "set(" ++ refNam ++ " + " ++ show i ++ ", " ++ argT ++ ");" | (i,argT) <- zip [0..] argsT]
+  return $ "term_new(REF, u12v2_new(" ++ show rFid ++ ", " ++ show arity ++ "), " ++ refNam ++ ")"
+#93:
+-- Fast Compiler
+-- -------------
+#94:
+-- Compiles a function using Fast-Mode
+compileFast :: Book -> Word64 -> Core -> Bool -> [(Bool,String)] -> Compile ()
+compileFast book fid core copy args = do
+  emit $ "Term " ++ mget (idToName book) fid ++ "_f(Term ref) {"
+  tabInc
+  emit "u64 itrs = 0;"
+  args <- forM (zip [0..] args) $ \ (i, (strict, arg)) -> do
+    argNam <- fresh "arg"
+    if strict then do
+      emit $ "Term " ++ argNam ++ " = reduce_at(term_loc(ref) + " ++ show i ++ ");"
+    else do
+      emit $ "Term " ++ argNam ++ " = got(term_loc(ref) + " ++ show i ++ ");"
+    if copy && strict then do
+      case MS.lookup fid (idToLabs book) of
+        Just labs -> do
+          emit $ "if (term_tag(" ++ argNam ++ ") == ERA) {"
+          emit $ "  return term_new(ERA, 0, 0);"
+          emit $ "}"
+          emit $ "if (term_tag(" ++ argNam ++ ") == SUP) {"
+          tabInc
+          emit $ "u64 lab = term_lab(" ++ argNam ++ ");"
+          emit $ "if (1"
+          forM_ (MS.keys labs) $ \lab -> do
+            emit $ "    && lab != " ++ show lab
+          emit $ ") {"
+          tabInc
+          emit $ "Term term = reduce_ref_sup(ref, " ++ show i ++ ");"
+          emit $ "return term;"
+          tabDec
+          emit $ "}"
+          tabDec
+          emit $ "}"
+        Nothing -> return ()
+    else
+      return ()
+    bind arg argNam
+    return argNam
+  compileFastArgs book fid core args MS.empty
+  tabDec
+  emit "}"
+#95:
+-- Compiles a fast function's argument list
+compileFastArgs :: Book -> Word64 -> Core -> [String] -> MS.Map Int [String] -> Compile ()
+compileFastArgs book fid body ctx reuse = do
+  emit $ "while (1) {"
+  tabInc
+  compileFastBody book fid body ctx False 0 reuse
+  tabDec
+  emit $ "}"
+#96:
+-- Compiles a fast function body (pattern-matching)
+compileFastBody :: Book -> Word64 -> Core -> [String] -> Bool -> Int -> MS.Map Int [String] -> Compile ()
+compileFastBody book fid term@(Mat val mov css) ctx stop@False itr reuse = do
+  valT   <- compileFastCore book fid val reuse
+  valNam <- fresh "val"
+  numNam <- fresh "num"
+  emit $ "Term " ++ valNam ++ " = (" ++ valT ++ ");"
+  let isNumeric = length css > 0 && (let (ctr,fds,bod) = css !! 0 in ctr == "0")
+#97:
+  -- Numeric Pattern-Matching
+  if isNumeric then do
+    emit $ "if (term_tag("++valNam++") == W32) {"
+    tabInc
+    emit $ "u32 " ++ numNam ++ " = term_loc(" ++ valNam ++ ");"
+    emit $ "switch (" ++ numNam ++ ") {"
+    tabInc
+    forM_ (zip [0..] css) $ \ (i, (ctr,fds,bod)) -> do
+      if i < length css - 1 then do
+        emit $ "case " ++ show i ++ ": {"
+        tabInc
+        forM_ mov $ \ (key,val) -> do
+          valT <- compileFastCore book fid val reuse
+          bind key valT
+        compileFastBody book fid bod ctx stop (itr + 1 + length mov) reuse
+        emit $ "break;"
+        tabDec
+        emit $ "}"
+      else do
+        emit $ "default: {"
+        tabInc
+        preNam <- fresh "pre"
+        emit $ "Term " ++ preNam ++ " = " ++ "term_new(W32, 0, "++numNam++" - "++show (length css - 1)++");"
+        forM_ fds $ \ fd -> do
+          bind fd preNam
+        forM_ mov $ \ (key,val) -> do
+          valT <- compileFastCore book fid val reuse
+          bind key valT
+        compileFastBody book fid bod ctx stop (itr + 1 + length fds + length mov) reuse
+        emit $ "break;"
+        tabDec
+        emit $ "}"
+    tabDec
+    emit $ "}"
+    tabDec
+    emit $ "}"
+#98:
+  -- Constructor Pattern-Matching (with IfLet)
+  else do
+    if ifLetLab book term > 0 then do
+      emit $ "if (term_tag(" ++ valNam ++ ") == CTR) {"
+      tabInc
+      emit $ "if (u12v2_x(term_lab(" ++ valNam ++ ")) == " ++ show (ifLetLab book term - 1) ++ ") {"
+      tabInc
+      let (ctr,fds,bod) = css !! 0
+      let reuse' = MS.insertWith (++) (length fds) ["term_loc(" ++ valNam ++ ")"] reuse
+      forM_ (zip [0..] fds) $ \ (k,fd) -> do
+        fdNam <- fresh "fd"
+        emit $ "Term " ++ fdNam ++ " = got(term_loc(" ++ valNam ++ ") + " ++ show k ++ ");"
+        bind fd fdNam
+      forM_ mov $ \ (key,val) -> do
+        valT <- compileFastCore book fid val reuse'
+        bind key valT
+      compileFastBody book fid bod ctx stop (itr + 1 + length fds + length mov) reuse'
+      tabDec
+      emit $ "} else {"
+      tabInc
+      let (ctr,fds,bod) = css !! 1
+      when (length fds /= 1) $ do
+        error "incorrect arity on if-let default case"
+      fdNam <- fresh "fd"
+      emit $ "Term " ++ fdNam ++ " = " ++ valNam ++ ";"
+      bind (head fds) fdNam
+      forM_ mov $ \ (key,val) -> do
+        valT <- compileFastCore book fid val reuse
+        bind key valT
+      compileFastBody book fid bod ctx stop (itr + 1 + 1 + length mov) reuse
+      tabDec
+      emit $ "}"
+      tabDec
+      emit $ "}"
+#99:
+    -- Constructor Pattern-Matching (without IfLet)
+    else do
+      emit $ "if (term_tag(" ++ valNam ++ ") == CTR) {"
+      tabInc
+      emit $ "switch (u12v2_x(term_lab(" ++ valNam ++ "))) {"
+      tabInc
+      forM_ (zip [0..] css) $ \ (i, (ctr,fds,bod)) -> do
+        emit $ "case " ++ show i ++ ": {"
+        tabInc
+        let reuse' = MS.insertWith (++) (length fds) ["term_loc(" ++ valNam ++ ")"] reuse
+        forM_ (zip [0..] fds) $ \ (k,fd) -> do
+          fdNam <- fresh "fd"
+          emit $ "Term " ++ fdNam ++ " = got(term_loc(" ++ valNam ++ ") + " ++ show k ++ ");"
+          bind fd fdNam
+        forM_ mov $ \ (key,val) -> do
+          valT <- compileFastCore book fid val reuse'
+          bind key valT
+        compileFastBody book fid bod ctx stop (itr + 1 + length fds + length mov) reuse'
+        emit $ "break;"
+        tabDec
+        emit $ "}"
+      tabDec
+      emit $ "}"
+      tabDec
+      emit $ "}"
+#100:
+  compileFastUndo book fid term ctx itr reuse
+#101:
+compileFastBody book fid term@(Dup lab dp0 dp1 val bod) ctx stop itr reuse = do
+  valT <- compileFastCore book fid val reuse
+  valNam <- fresh "val"
+  dp0Nam <- fresh "dp0"
+  dp1Nam <- fresh "dp1"
+  emit $ "Term " ++ valNam ++ " = (" ++ valT ++ ");"
+  emit $ "Term " ++ dp0Nam ++ ";"
+  emit $ "Term " ++ dp1Nam ++ ";"
+  emit $ "if (term_tag(" ++ valNam ++ ") == W32) {"
+  tabInc
+  emit $ "itrs += 1;"
+  emit $ dp0Nam ++ " = " ++ valNam ++ ";"
+  emit $ dp1Nam ++ " = " ++ valNam ++ ";"
+  tabDec
+  emit $ "} else {"
+  tabInc
+  dupNam <- fresh "dup"
+  dupLoc <- compileFastAlloc 2 reuse
+  emit $ "Loc " ++ dupNam ++ " = " ++ dupLoc ++ ";"
+  emit $ "set(" ++ dupNam ++ " + 0, " ++ valNam ++ ");"
+  emit $ "set(" ++ dupNam ++ " + 1, term_new(SUB, 0, 0));"
+  emit $ dp0Nam ++ " = term_new(DP0, " ++ show lab ++ ", " ++ dupNam ++ " + 0);"
+  emit $ dp1Nam ++ " = term_new(DP1, " ++ show lab ++ ", " ++ dupNam ++ " + 0);"
+  tabDec
+  emit $ "}"
+  bind dp0 dp0Nam
+  bind dp1 dp1Nam
+  compileFastBody book fid bod ctx stop itr reuse
+#102:
+compileFastBody book fid term@(Let mode var val bod) ctx stop itr reuse = do
+  valT <- compileFastCore book fid val reuse
+  case mode of
+    LAZY -> do
+      bind var valT
+    STRI -> do
+      case val of
+        Ref _ rFid _ -> do
+          valNam <- fresh "val"
+          emit $ "Term " ++ valNam ++ " = reduce(" ++ mget (idToName book) rFid ++ "_f(" ++ valT ++ "));"
+          bind var valNam
+        _ -> do
+          valNam <- fresh "val" 
+          emit $ "Term " ++ valNam ++ " = reduce(" ++ valT ++ ");"
+          bind var valNam
+    PARA -> do -- TODO: implement parallel evaluation
+      valNam <- fresh "val"
+      emit $ "Term " ++ valNam ++ " = reduce(" ++ valT ++ ");"
+      bind var valNam
+  compileFastBody book fid bod ctx stop itr reuse
+#103:
+compileFastBody book fid term@(Ref fNam fFid fArg) ctx stop itr reuse | fFid == fid = do
+  forM_ (zip fArg ctx) $ \ (arg, ctxVar) -> do
+    argT <- compileFastCore book fid arg reuse
+    emit $ "" ++ ctxVar ++ " = " ++ argT ++ ";"
+  emit $ "itrs += " ++ show (itr + 1) ++ ";"
+  emit $ "continue;"
+#104:
+compileFastBody book fid term ctx stop itr reuse = do
+  emit $ "itrs += " ++ show itr ++ ";"
+  body <- compileFastCore book fid term reuse
+  compileFastSave book fid term ctx itr reuse
+  emit $ "return " ++ body ++ ";"
+#105:
+-- Falls back from fast mode to full mode
+compileFastUndo :: Book -> Word64 -> Core -> [String] -> Int -> MS.Map Int [String] -> Compile ()
+compileFastUndo book fid term ctx itr reuse = do
+  forM_ (zip [0..] ctx) $ \ (i, arg) -> do
+    emit $ "set(term_loc(ref) + "++show i++", " ++ arg ++ ");"
+  emit $ "return " ++ mget (idToName book) fid ++ "_t(ref);"
+#106:
+-- Completes a fast mode call
+compileFastSave :: Book -> Word64 -> Core -> [String] -> Int -> MS.Map Int [String] -> Compile ()
+compileFastSave book fid term ctx itr reuse = do
+  emit $ "*HVM.itrs += itrs;"
+#107:
+-- Helper function to allocate nodes with reuse
+compileFastAlloc :: Int -> MS.Map Int [String] -> Compile String
+compileFastAlloc arity reuse = do
+  return $ "alloc_node(" ++ show arity ++ ")"
+  -- FIXME: temporarily disabled, caused bug in:
+  -- data List {
+    -- #Nil
+    -- #Cons{head tail}
+  -- }
+  -- @cat(xs ys) = ~xs !ys {
+    -- #Nil: ys
+    -- #Cons{h t}: #Cons{h @cat(t ys)}
+  -- }
+  -- @main = @cat(#Cons{1 #Nil} #Nil)
+  -- case MS.lookup arity reuse of
+    -- Just (loc:locs) -> return loc
+    -- _ -> return $ "alloc_node(" ++ show arity ++ ")"
+#108:
+-- Compiles a core term in fast mode
+compileFastCore :: Book -> Word64 -> Core -> MS.Map Int [String] -> Compile String
+#109:
+compileFastCore book fid Era reuse = 
+  return $ "term_new(ERA, 0, 0)"
+#110:
+compileFastCore book fid (Let mode var val bod) reuse = do
+  valT <- compileFastCore book fid val reuse
+  case mode of
+    LAZY -> do
+      emit $ "itrs += 1;"
+      bind var valT
+    STRI -> do
+      valNam <- fresh "val"
+      emit $ "itrs += 1;"
+      emit $ "Term " ++ valNam ++ " = reduce(" ++ valT ++ ");"
+      bind var valNam
+    PARA -> do -- TODO: implement parallel evaluation
+      valNam <- fresh "val"
+      emit $ "Term " ++ valNam ++ " = reduce(" ++ valT ++ ");"
+      bind var valNam
+  compileFastCore book fid bod reuse
+#111:
+compileFastCore book fid (Var name) reuse = do
+  compileFastVar name
+#112:
+compileFastCore book fid (Lam var bod) reuse = do
+  lamNam <- fresh "lam"
+  lamLoc <- compileFastAlloc 1 reuse
+  emit $ "Loc " ++ lamNam ++ " = " ++ lamLoc ++ ";"
+  -- emit $ "set(" ++ lamNam ++ " + 0, term_new(SUB, 0, 0));"
+  bind var $ "term_new(VAR, 0, " ++ lamNam ++ " + 0)"
+  bodT <- compileFastCore book fid bod reuse
+  emit $ "set(" ++ lamNam ++ " + 0, " ++ bodT ++ ");"
+  return $ "term_new(LAM, 0, " ++ lamNam ++ ")"
+#113:
+compileFastCore book fid (App fun arg) reuse = do
+  appNam <- fresh "app"
+  appLoc <- compileFastAlloc 2 reuse
+  emit $ "Loc " ++ appNam ++ " = " ++ appLoc ++ ";"
+  funT <- compileFastCore book fid fun reuse
+  argT <- compileFastCore book fid arg reuse
+  emit $ "set(" ++ appNam ++ " + 0, " ++ funT ++ ");"
+  emit $ "set(" ++ appNam ++ " + 1, " ++ argT ++ ");"
+  return $ "term_new(APP, 0, " ++ appNam ++ ")"
+#114:
+compileFastCore book fid (Sup lab tm0 tm1) reuse = do
+  supNam <- fresh "sup"
+  supLoc <- compileFastAlloc 2 reuse
+  emit $ "Loc " ++ supNam ++ " = " ++ supLoc ++ ";"
+  tm0T <- compileFastCore book fid tm0 reuse
+  tm1T <- compileFastCore book fid tm1 reuse
+  emit $ "set(" ++ supNam ++ " + 0, " ++ tm0T ++ ");"
+  emit $ "set(" ++ supNam ++ " + 1, " ++ tm1T ++ ");"
+  return $ "term_new(SUP, " ++ show lab ++ ", " ++ supNam ++ ")"
+#115:
+compileFastCore book fid (Dup lab dp0 dp1 val bod) reuse = do
+  dupNam <- fresh "dup"
+  dp0Nam <- fresh "dp0"
+  dp1Nam <- fresh "dp1"
+  valNam <- fresh "val"
+  valT   <- compileFastCore book fid val reuse
+  emit $ "Term " ++ valNam ++ " = (" ++ valT ++ ");"
+  emit $ "Term " ++ dp0Nam ++ ";"
+  emit $ "Term " ++ dp1Nam ++ ";"
+  emit $ "if (term_tag("++valNam++") == W32 || term_tag("++valNam++") == CHR) {"
+  tabInc
+  emit $ "itrs += 1;"
+  emit $ dp0Nam ++ " = " ++ valNam ++ ";"
+  emit $ dp1Nam ++ " = " ++ valNam ++ ";"
+  tabDec
+  emit $ "} else {"
+  tabInc
+  dupLoc <- compileFastAlloc 2 reuse
+  emit $ "Loc " ++ dupNam ++ " = " ++ dupLoc ++ ";"
+  emit $ "set(" ++ dupNam ++ " + 0, " ++ valNam ++ ");"
+  emit $ "set(" ++ dupNam ++ " + 1, term_new(SUB, 0, 0));"
+  emit $ dp0Nam ++ " = term_new(DP0, " ++ show lab ++ ", " ++ dupNam ++ " + 0);"
+  emit $ dp1Nam ++ " = term_new(DP1, " ++ show lab ++ ", " ++ dupNam ++ " + 0);"
+  tabDec
+  emit $ "}"
+  bind dp0 dp0Nam
+  bind dp1 dp1Nam
+  compileFastCore book fid bod reuse
+#116:
+compileFastCore book fid (Ctr cid fds) reuse = do
+  ctrNam <- fresh "ctr"
+  let arity = length fds
+  ctrLoc <- compileFastAlloc arity reuse
+  emit $ "Loc " ++ ctrNam ++ " = " ++ ctrLoc ++ ";"
+  fdsT <- mapM (\ (i,fd) -> compileFastCore book fid fd reuse) (zip [0..] fds)
+  sequence_ [emit $ "set(" ++ ctrNam ++ " + " ++ show i ++ ", " ++ fdT ++ ");" | (i,fdT) <- zip [0..] fdsT]
+  return $ "term_new(CTR, u12v2_new(" ++ show cid ++ ", " ++ show arity ++ "), " ++ ctrNam ++ ")"
+#117:
+compileFastCore book fid tm@(Mat val mov css) reuse = do
+  matNam <- fresh "mat"
+  let arity = length css
+  matLoc <- compileFastAlloc (1 + arity) reuse
+  emit $ "Loc " ++ matNam ++ " = " ++ matLoc ++ ";"
+  valT <- compileFastCore book fid val reuse
+  emit $ "set(" ++ matNam ++ " + 0, " ++ valT ++ ");"
+  forM_ (zip [0..] css) $ \ (i,(ctr,fds,bod)) -> do
+    let bod' = foldr Lam (foldr Lam bod (map fst mov)) fds
+    bodT <- compileFastCore book fid bod' reuse
+    emit $ "set(" ++ matNam ++ " + " ++ show (i+1) ++ ", " ++ bodT ++ ");"
+  let mat = "term_new(MAT, u12v2_new(" ++ show arity ++ "," ++ show (ifLetLab book tm) ++ "), " ++ matNam ++ ")"
+  foldM (\term (key, val) -> do
+    appNam <- fresh "app"
+    appLoc <- compileFastAlloc 2 reuse
+    emit $ "Loc " ++ appNam ++ " = " ++ appLoc ++ ";"
+    valT <- compileFastCore book fid val reuse
+    emit $ "set(" ++ appNam ++ " + 0, " ++ term ++ ");"
+    emit $ "set(" ++ appNam ++ " + 1, " ++ valT ++ ");"
+    return $ "term_new(APP, 0, " ++ appNam ++ ")"
+    ) mat mov
+#118:
+compileFastCore book fid (U32 val) reuse =
+  return $ "term_new(W32, 0, " ++ show (fromIntegral val) ++ ")"
+#119:
+compileFastCore book fid (Chr val) reuse =
+  return $ "term_new(CHR, 0, " ++ show (fromEnum val) ++ ")"
+#120:
+compileFastCore book fid (Op2 opr nu0 nu1) reuse = do
+  opxNam <- fresh "opx"
+  retNam <- fresh "ret"
+  nu0Nam <- fresh "nu0"
+  nu1Nam <- fresh "nu1"
+  nu0T <- compileFastCore book fid nu0 reuse
+  nu1T <- compileFastCore book fid nu1 reuse
+  emit $ "Term " ++ nu0Nam ++ " = (" ++ nu0T ++ ");"
+  emit $ "Term " ++ nu1Nam ++ " = (" ++ nu1T ++ ");"
+  emit $ "Term " ++ retNam ++ ";"
+  emit $ "if (term_tag(" ++ nu0Nam ++ ") == W32 && term_tag(" ++ nu1Nam ++ ") == W32) {"
+  emit $ "  itrs += 2;"
+  let oprStr = case opr of
+        OP_ADD -> "+"
+        OP_SUB -> "-"
+        OP_MUL -> "*"
+        OP_DIV -> "/"
+        OP_MOD -> "%"
+        OP_EQ  -> "=="
+        OP_NE  -> "!="
+        OP_LT  -> "<"
+        OP_GT  -> ">"
+        OP_LTE -> "<="
+        OP_GTE -> ">="
+        OP_AND -> "&"
+        OP_OR  -> "|"
+        OP_XOR -> "^"
+        OP_LSH -> "<<"
+        OP_RSH -> ">>"
+  emit $ "  " ++ retNam ++ " = term_new(W32, 0, term_loc(" ++ nu0Nam ++ ") " ++ oprStr ++ " term_loc(" ++ nu1Nam ++ "));"
+  emit $ "} else {"
+  opxLoc <- compileFastAlloc 2 reuse
+  emit $ "  Loc " ++ opxNam ++ " = " ++ opxLoc ++ ";"
+  emit $ "  set(" ++ opxNam ++ " + 0, " ++ nu0Nam ++ ");"
+  emit $ "  set(" ++ opxNam ++ " + 1, " ++ nu1Nam ++ ");"
+  emit $ "  " ++ retNam ++ " = term_new(OPX, " ++ show (fromEnum opr) ++ ", " ++ opxNam ++ ");"
+  emit $ "}"
+  return $ retNam
+#121:
+compileFastCore book fid (Ref rNam rFid rArg) reuse = do
+#122:
+  -- Inline Dynamic SUP
+  if rNam == "SUP" then do
+    let [lab, tm0, tm1] = rArg
+    supNam <- fresh "sup"
+    labNam <- fresh "lab"
+    supLoc <- compileFastAlloc 2 reuse
+    labT <- compileFastCore book fid lab reuse
+    emit $ "Term " ++ labNam ++ " = reduce(" ++ labT ++ ");"
+    emit $ "if (term_tag(" ++ labNam ++ ") != W32) {"
+    emit $ "  printf(\"ERROR:non-numeric-sup-label\\n\");"
+    emit $ "}"
+    emit $ "itrs += 1;"
+    emit $ "Loc " ++ supNam ++ " = " ++ supLoc ++ ";"
+    tm0T <- compileFastCore book fid tm0 reuse
+    tm1T <- compileFastCore book fid tm1 reuse
+    emit $ "set(" ++ supNam ++ " + 0, " ++ tm0T ++ ");"
+    emit $ "set(" ++ supNam ++ " + 1, " ++ tm1T ++ ");"
+    return $ "term_new(SUP, term_loc(" ++ labNam ++ "), " ++ supNam ++ ")"
+#123:
+  -- Inline Dynamic DUP
+  else if rNam == "DUP" && (case rArg of [_, _, Lam _ (Lam _ _)] -> True ; _ -> False) then do
+    let [lab, val, Lam x (Lam y body)] = rArg
+    dupNam <- fresh "dup"
+    labNam <- fresh "lab"
+    dupLoc <- compileFastAlloc 2 reuse
+    labT <- compileFastCore book fid lab reuse
+    emit $ "Term " ++ labNam ++ " = reduce(" ++ labT ++ ");"
+    emit $ "if (term_tag(" ++ labNam ++ ") != W32) {"
+    emit $ "  printf(\"ERROR:non-numeric-sup-label\\n\");"
+    emit $ "}"
+    emit $ "itrs += 3;"
+    emit $ "Loc " ++ dupNam ++ " = " ++ dupLoc ++ ";"
+    valT <- compileFastCore book fid val reuse
+    emit $ "set(" ++ dupNam ++ " + 0, " ++ valT ++ ");"
+    emit $ "set(" ++ dupNam ++ " + 1, term_new(SUB, 0, 0));"
+    bind x $ "term_new(DP0, term_loc(" ++ labNam ++ "), " ++ dupNam ++ " + 0)"
+    bind y $ "term_new(DP1, term_loc(" ++ labNam ++ "), " ++ dupNam ++ " + 0)"
+    compileFastCore book fid body reuse
+#124:
+  -- Create REF node
+  else do
+    refNam <- fresh "ref"
+    let arity = length rArg
+    refLoc <- compileFastAlloc arity reuse
+    emit $ "Loc " ++ refNam ++ " = " ++ refLoc ++ ";"
+    argsT <- mapM (\ (i,arg) -> compileFastCore book fid arg reuse) (zip [0..] rArg)
+    sequence_ [emit $ "set(" ++ refNam ++ " + " ++ show i ++ ", " ++ argT ++ ");" | (i,argT) <- zip [0..] argsT]
+    return $ "term_new(REF, u12v2_new(" ++ show rFid ++ ", " ++ show arity ++ "), " ++ refNam ++ ")"
+#125:
+-- Compiles a variable in fast mode
+compileFastVar :: String -> Compile String
+compileFastVar var = do
+  bins <- gets bins
+  case MS.lookup var bins of
+    Just entry -> do
+      return entry
+    Nothing -> do
+      return "<ERR>"
+#126:
+-- Compiles a function using Fast-Mode
+compileSlow :: Book -> Word64 -> Core -> Bool -> [(Bool,String)] -> Compile ()
+compileSlow book fid core copy args = do
+  emit $ "Term " ++ mget (idToName book) fid ++ "_f(Term ref) {"
+  emit $ "  return " ++ mget (idToName book) fid ++ "_t(ref);"
+  emit $ "}"
+./Extract.hs
+#127:
+#128:
+module HVML.Extract where
+#129:
+import Control.Monad (foldM)
+import Control.Monad.State
+import Data.Char (chr, ord)
+import Data.IORef
+import Data.Word
+import HVML.Show
+import HVML.Type
+import System.IO.Unsafe (unsafeInterleaveIO)
+import qualified Data.IntSet as IS
+import qualified Data.Map.Strict as MS
+import Debug.Trace
+#130:
+extractCoreAt :: IORef IS.IntSet -> ReduceAt -> Book -> Loc -> HVM Core
+#131:
+extractCoreAt dupsRef reduceAt book host = unsafeInterleaveIO $ do
+  term <- reduceAt book host
+  case tagT (termTag term) of
+#132:
+    ERA -> do
+      return Era
+#133:
+    LET -> do
+      let loc  = termLoc term
+      let mode = modeT (termLab term)
+      name <- return $ "$" ++ show (loc + 0)
+      val  <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      bod  <- extractCoreAt dupsRef reduceAt book (loc + 1)
+      return $ Let mode name val bod
+#134:
+    LAM -> do
+      let loc = termLoc term
+      name <- return $ "$" ++ show (loc + 0)
+      bod  <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      return $ Lam name bod
+#135:
+    APP -> do
+      let loc = termLoc term
+      fun <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      arg <- extractCoreAt dupsRef reduceAt book (loc + 1)
+      return $ App fun arg
+#136:
+    SUP -> do
+      let loc = termLoc term
+      let lab = termLab term
+      tm0 <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      tm1 <- extractCoreAt dupsRef reduceAt book (loc + 1)
+      return $ Sup lab tm0 tm1
+#137:
+    VAR -> do
+      let loc = termLoc term
+      sub <- got (loc + 0)
+      if termGetBit sub == 0
+        then do
+          name <- return $ "$" ++ show (loc + 0)
+          return $ Var name
+        else do
+          set (loc + 0) (termRemBit sub)
+          extractCoreAt dupsRef reduceAt book (loc + 0)
+#138:
+    DP0 -> do
+      let loc = termLoc term
+      let lab = termLab term
+      dups <- readIORef dupsRef
+      if IS.member (fromIntegral loc) dups
+      then do
+        name <- return $ "$" ++ show (loc + 0)
+        return $ Var name
+      else do
+        dp0 <- return $ "$" ++ show (loc + 0)
+        dp1 <- return $ "$" ++ show (loc + 1)
+        val <- extractCoreAt dupsRef reduceAt book loc
+        modifyIORef' dupsRef (IS.insert (fromIntegral loc))
+        return $ Dup lab dp0 dp1 val (Var dp0)
+#139:
+    DP1 -> do
+      let loc = termLoc term
+      let lab = termLab term
+      dups <- readIORef dupsRef
+      if IS.member (fromIntegral loc) dups
+      then do
+        name <- return $ "$" ++ show (loc + 1)
+        return $ Var name
+      else do
+        dp0 <- return $ "$" ++ show (loc + 0)
+        dp1 <- return $ "$" ++ show (loc + 1)
+        val <- extractCoreAt dupsRef reduceAt book loc
+        modifyIORef' dupsRef (IS.insert (fromIntegral loc))
+        return $ Dup lab dp0 dp1 val (Var dp1)
+#140:
+    CTR -> do
+      let loc = termLoc term
+      let lab = termLab term
+      let cid = u12v2X lab
+      let ari = u12v2Y lab
+      let ars = if ari == 0 then [] else [0..ari-1]
+      fds <- mapM (\i -> extractCoreAt dupsRef reduceAt book (loc + i)) ars
+      return $ Ctr cid fds
+#141:
+    MAT -> do
+      let loc = termLoc term
+      let len = u12v2X $ termLab term
+      val <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      css <- mapM (\i -> extractCoreAt dupsRef reduceAt book (loc + 1 + i)) [0..len-1]
+      css <- mapM (\c -> return ("#", [], c)) css -- FIXME: recover names and fields on extraction (must store id)
+      return $ Mat val [] css
+#142:
+    W32 -> do
+      let val = termLoc term
+      return $ U32 (fromIntegral val)
+#143:
+    CHR -> do
+      let val = termLoc term
+      return $ Chr (chr (fromIntegral val))
+#144:
+    OPX -> do
+      let loc = termLoc term
+      let opr = toEnum (fromIntegral (termLab term))
+      nm0 <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      nm1 <- extractCoreAt dupsRef reduceAt book (loc + 1)
+      return $ Op2 opr nm0 nm1
+#145:
+    OPY -> do
+      let loc = termLoc term
+      let opr = toEnum (fromIntegral (termLab term))
+      nm0 <- extractCoreAt dupsRef reduceAt book (loc + 0)
+      nm1 <- extractCoreAt dupsRef reduceAt book (loc + 1)
+      return $ Op2 opr nm0 nm1
+#146:
+    REF -> do
+      let loc = termLoc term
+      let lab = termLab term
+      let fid = u12v2X lab
+      let ari = u12v2Y lab
+      let aux = if ari == 0 then [] else [0..ari-1]
+      arg <- mapM (\i -> extractCoreAt dupsRef reduceAt book (loc + i)) aux
+      let name = MS.findWithDefault "?" fid (idToName book)
+      return $ Ref name fid arg
+#147:
+    _ -> do
+      return Era
+#148:
+doExtractCoreAt :: ReduceAt -> Book -> Loc -> HVM Core
+doExtractCoreAt reduceAt book loc = do
+  dupsRef <- newIORef IS.empty
+  core    <- extractCoreAt dupsRef reduceAt book loc
+  return core
+  -- return $ doLiftDups core
+#149:
+-- Lifting Dups
+-- ------------
+#150:
+liftDups :: Core -> (Core, Core -> Core)
+#151:
+liftDups (Var nam) =
+  (Var nam, id)
+#152:
+liftDups (Ref nam fid arg) =
+  let (argT, argD) = liftDupsList arg
+  in (Ref nam fid argT, argD)
+#153:
+liftDups Era =
+  (Era, id)
+#154:
+liftDups (Lam str bod) =
+  let (bodT, bodD) = liftDups bod
+  in (Lam str bodT, bodD)
+#155:
+liftDups (App fun arg) =
+  let (funT, funD) = liftDups fun
+      (argT, argD) = liftDups arg
+  in (App funT argT, funD . argD)
+#156:
+liftDups (Sup lab tm0 tm1) =
+  let (tm0T, tm0D) = liftDups tm0
+      (tm1T, tm1D) = liftDups tm1
+  in (Sup lab tm0T tm1T, tm0D . tm1D)
+#157:
+liftDups (Dup lab dp0 dp1 val bod) =
+  let (valT, valD) = liftDups val
+      (bodT, bodD) = liftDups bod
+  in (bodT, \x -> valD (bodD (Dup lab dp0 dp1 valT x)))
+#158:
+liftDups (Ctr cid fds) =
+  let (fdsT, fdsD) = liftDupsList fds
+  in (Ctr cid fdsT, fdsD)
+#159:
+liftDups (Mat val mov css) =
+  let (valT, valD) = liftDups val
+      (movT, movD) = liftDupsMov mov
+      (cssT, cssD) = liftDupsCss css
+  in (Mat valT movT cssT, valD . movD . cssD)
+#160:
+liftDups (U32 val) =
+  (U32 val, id)
+#161:
+liftDups (Chr val) =
+  (Chr val, id)
+#162:
+liftDups (Op2 opr nm0 nm1) =
+  let (nm0T, nm0D) = liftDups nm0
+      (nm1T, nm1D) = liftDups nm1
+  in (Op2 opr nm0T nm1T, nm0D . nm1D)
+#163:
+liftDups (Let mod nam val bod) =
+  let (valT, valD) = liftDups val
+      (bodT, bodD) = liftDups bod
+  in (Let mod nam valT bodT, valD . bodD)
+#164:
+liftDupsList :: [Core] -> ([Core], Core -> Core)
+#165:
+liftDupsList [] = 
+  ([], id)
+#166:
+liftDupsList (x:xs) =
+  let (xT, xD)   = liftDups x
+      (xsT, xsD) = liftDupsList xs
+  in (xT:xsT, xD . xsD)
+#167:
+liftDupsMov :: [(String, Core)] -> ([(String, Core)], Core -> Core)
+#168:
+liftDupsMov [] = 
+  ([], id)
+#169:
+liftDupsMov ((k,v):xs) =
+  let (vT, vD)   = liftDups v
+      (xsT, xsD) = liftDupsMov xs
+  in ((k,vT):xsT, vD . xsD)
+#170:
+liftDupsCss :: [(String, [String], Core)] -> ([(String, [String], Core)], Core -> Core)
+#171:
+liftDupsCss [] = 
+  ([], id)
+#172:
+liftDupsCss ((c,fs,b):xs) =
+  let (bT, bD)   = liftDups b
+      (xsT, xsD) = liftDupsCss xs
+  in ((c,fs,bT):xsT, bD . xsD)
+#173:
+doLiftDups :: Core -> Core
+doLiftDups term =
+  let (termExpr, termDups) = liftDups term in
+  let termBody = termDups (Var "") in
+  -- hack to print expr before dups
+  Let LAZY "" termExpr termBody
+./Inject.hs
+#174:
+#175:
+module HVML.Inject where
+#176:
+import Control.Monad (foldM, when, forM_)
+import Control.Monad.State
+import Data.Char (ord)
+import Data.Word
+import HVML.Show
+import HVML.Type
+import qualified Data.Map.Strict as Map
+#177:
+type InjectM a = StateT InjectState HVM a
+#178:
+data InjectState = InjectState
+  { args :: Map.Map String Term -- maps var names to binder locations
+  , vars :: [(String, Loc)]     -- list of (var name, usage location) pairs
+  }
+#179:
+emptyState :: InjectState
+emptyState = InjectState Map.empty []
+#180:
+injectCore :: Book -> Core -> Loc -> InjectM ()
+#181:
+injectCore _ Era loc = do
+  lift $ set loc (termNew _ERA_ 0 0)
+#182:
+injectCore _ (Var nam) loc = do
+  argsMap <- gets args
+  case Map.lookup nam argsMap of
+    Just term -> do
+      lift $ set loc term
+      when (head nam /= '&') $ do
+        modify $ \s -> s { args = Map.delete nam (args s) }
+    Nothing -> do
+      modify $ \s -> s { vars = (nam, loc) : vars s }
+#183:
+injectCore book (Let mod nam val bod) loc = do
+  let_node <- lift $ allocNode 2
+  modify $ \s -> s { args = Map.insert nam (termNew _VAR_ 0 (let_node + 0)) (args s) }
+  injectCore book val (let_node + 0)
+  injectCore book bod (let_node + 1)
+  lift $ set loc (termNew _LET_ (fromIntegral $ fromEnum mod) let_node)
+#184:
+injectCore book (Lam vr0 bod) loc = do
+  lam <- lift $ allocNode 1
+  -- lift $ set (lam + 0) (termNew _SUB_ 0 0)
+  modify $ \s -> s { args = Map.insert vr0 (termNew _VAR_ 0 (lam + 0)) (args s) }
+  injectCore book bod (lam + 0)
+  lift $ set loc (termNew _LAM_ 0 lam)
+#185:
+injectCore book (App fun arg) loc = do
+  app <- lift $ allocNode 2
+  injectCore book fun (app + 0)
+  injectCore book arg (app + 1)
+  lift $ set loc (termNew _APP_ 0 app)
+#186:
+injectCore book (Sup lab tm0 tm1) loc = do
+  sup <- lift $ allocNode 2
+  injectCore book tm0 (sup + 0)
+  injectCore book tm1 (sup + 1)
+  lift $ set loc (termNew _SUP_ lab sup)
+#187:
+injectCore book (Dup lab dp0 dp1 val bod) loc = do
+  dup <- lift $ allocNode 2
+  -- lift $ set (dup + 0) (termNew _SUB_ 0 0)
+  lift $ set (dup + 1) (termNew _SUB_ 0 0)
+  modify $ \s -> s 
+    { args = Map.insert dp0 (termNew _DP0_ lab dup) 
+           $ Map.insert dp1 (termNew _DP1_ lab dup) (args s) 
+    }
+  injectCore book val (dup + 0)
+  injectCore book bod loc
+#188:
+injectCore book (Ref nam fid arg) loc = do
+  -- lift $ set loc (termNew _REF_ 0 fid)
+  let arity = length arg
+  ref <- lift $ allocNode (fromIntegral arity)
+  sequence_ [injectCore book x (ref + i) | (i,x) <- zip [0..] arg]
+  lift $ set loc (termNew _REF_ (u12v2New fid (fromIntegral arity)) ref)
+#189:
+injectCore book (Ctr cid fds) loc = do
+  let arity = length fds
+  ctr <- lift $ allocNode (fromIntegral arity)
+  sequence_ [injectCore book fd (ctr + ix) | (ix,fd) <- zip [0..] fds]
+  lift $ set loc (termNew _CTR_ (u12v2New cid (fromIntegral arity)) ctr)
+#190:
+injectCore book tm@(Mat val mov css) loc = do
+  -- Allocate space for the Mat term
+  mat <- lift $ allocNode (1 + fromIntegral (length css))
+  -- Inject the value being matched
+  injectCore book val (mat + 0)
+  -- Inject each case body
+  forM_ (zip [0..] css) $ \ (idx, (ctr, fds, bod)) -> do
+    injectCore book (foldr Lam (foldr Lam bod (map fst mov)) fds) (mat + 1 + idx)
+  -- After processing all cases, create the Mat term
+  trm <- return $ termNew _MAT_ (u12v2New (fromIntegral (length css)) (ifLetLab book tm)) mat
+  ret <- foldM (\mat (_, val) -> do
+      app <- lift $ allocNode 2
+      lift $ set (app + 0) mat
+      injectCore book val (app + 1)
+      return $ termNew _APP_ 0 app)
+    trm
+    mov
+  lift $ set loc ret
+#191:
+injectCore book (U32 val) loc = do
+  lift $ set loc (termNew _W32_ 0 (fromIntegral val))
+#192:
+injectCore book (Chr val) loc = do
+  lift $ set loc (termNew _CHR_ 0 (fromIntegral $ ord val))
+#193:
+injectCore book (Op2 opr nm0 nm1) loc = do
+  opx <- lift $ allocNode 2
+  injectCore book nm0 (opx + 0)
+  injectCore book nm1 (opx + 1)
+  lift $ set loc (termNew _OPX_ (fromIntegral $ fromEnum opr) opx)
+#194:
+doInjectCoreAt :: Book -> Core -> Loc -> [(String,Term)] -> HVM Term
+doInjectCoreAt book core host argList = do
+  (_, state) <- runStateT (injectCore book core host) (emptyState { args = Map.fromList argList })
+  foldM (\m (name, loc) -> do
+    case Map.lookup name (args state) of
+      Just term -> do
+        set loc term
+        if (head name /= '&') then do
+          return $ Map.delete name m
+        else do
+          return $ m
+      Nothing -> do
+        error $ "Unbound variable: " ++ name)
+    (args state)
+    (vars state)
+  got host
+./Main.hs
+#195:
+-- Type.hs:
+#196:
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
+#197:
+module Main where
+#198:
+import Control.Monad (when, forM_)
+import Data.FileEmbed
+import Data.Time.Clock
+import Data.Word
+import Foreign.C.Types
+import Foreign.LibFFI
+import Foreign.LibFFI.Types
+import GHC.Conc
+import HVML.Collapse
+import HVML.Compile
+import HVML.Extract
+import HVML.Inject
+import HVML.Parse
+import HVML.Reduce
+import HVML.Show
+import HVML.Type
+import System.CPUTime
+import System.Environment (getArgs)
+import System.Exit (exitWith, ExitCode(ExitSuccess, ExitFailure))
+import System.IO
+import System.IO (readFile)
+import System.Posix.DynamicLinker
+import System.Process (callCommand)
+import Text.Printf
+import qualified Data.Map.Strict as MS
+#199:
+runtime_c :: String
+runtime_c = $(embedStringFile "./src/HVML/Runtime.c")
+#200:
+-- Main
+-- ----
+#201:
+data RunMode
+  = Normalize
+  | Collapse
+  | Search
+  deriving Eq
+#202:
+main :: IO ()
+main = do
+  args <- getArgs
+  result <- case args of
+    ("run" : file : args) -> do
+      let compiled = "-c" `elem` args
+      let collapse = "-C" `elem` args
+      let search   = "-S" `elem` args
+      let stats    = "-s" `elem` args
+      let debug    = "-d" `elem` args
+      let mode | collapse  = Collapse
+               | search    = Search
+               | otherwise = Normalize
+      cliRun file debug compiled mode stats
+    ["help"] -> printHelp
+    _ -> printHelp
+  case result of
+    Left err -> do
+      putStrLn err
+      exitWith (ExitFailure 1)
+    Right _ -> do
+      exitWith ExitSuccess
+#203:
+printHelp :: IO (Either String ())
+printHelp = do
+  putStrLn "HVM-Lazy usage:"
+  putStrLn "  hvml help       # Shows this help message"
+  putStrLn "  hvml run <file> # Evals main"
+  putStrLn "    -t # Returns the type (experimental)"
+  putStrLn "    -c # Runs with compiled mode (fast)"
+  putStrLn "    -C # Collapse the result to a list of λ-Terms"
+  putStrLn "    -S # Search (collapse, then print the 1st λ-Term)"
+  putStrLn "    -s # Show statistics"
+  putStrLn "    -d # Print execution steps (debug mode)"
+  return $ Right ()
+#204:
+-- CLI Commands
+-- ------------
+#205:
+cliRun :: FilePath -> Bool -> Bool -> RunMode -> Bool -> IO (Either String ())
+cliRun filePath debug compiled mode showStats = do
+  -- Initialize the HVM
+  hvmInit
+  -- TASK: instead of parsing a core term out of the file, lets parse a Book.
+  code <- readFile filePath
+  book <- doParseBook code
+  -- Create the C file content
+  let funcs = map (\ (fid, _) -> compile book fid) (MS.toList (idToFunc book))
+  let mainC = unlines $ [runtime_c] ++ funcs ++ [genMain book]
+  -- Compile to native
+  when compiled $ do
+    -- Write the C file
+    writeFile "./.main.c" mainC
+    -- Compile to shared library
+    callCommand "gcc -O2 -fPIC -shared .main.c -o .main.so"
+    -- Load the dynamic library
+    bookLib <- dlopen "./.main.so" [RTLD_NOW]
+    -- Remove both generated files
+    callCommand "rm .main.so"
+    -- Register compiled functions
+    forM_ (MS.keys (idToFunc book)) $ \ fid -> do
+      funPtr <- dlsym bookLib (mget (idToName book) fid ++ "_f")
+      hvmDefine fid funPtr
+    -- Link compiled state
+    hvmGotState <- hvmGetState
+    hvmSetState <- dlsym bookLib "hvm_set_state"
+    callFFI hvmSetState retVoid [argPtr hvmGotState]
+  -- Abort when main isn't present
+  when (not $ MS.member "main" (nameToId book)) $ do
+    putStrLn "Error: 'main' not found."
+    exitWith (ExitFailure 1)
+  -- Normalize main
+  init <- getCPUTime
+  root <- doInjectCoreAt book (Ref "main" (mget (nameToId book) "main") []) 0 []
+  rxAt <- if compiled
+    then return (reduceCAt debug)
+    else return (reduceAt debug)
+  vals <- if mode == Collapse || mode == Search
+    then doCollapseFlatAt rxAt book 0
+    else do
+      core <- doExtractCoreAt rxAt book 0
+      return [(doLiftDups core)]
+  -- Print all collapsed results
+  when (mode == Collapse) $ do
+    forM_ vals $ \ term -> do
+      putStrLn $ showCore term
+  -- Prints just the first collapsed result
+  when (mode == Search || mode == Normalize) $ do
+    putStrLn $ showCore (head vals)
+  when (mode /= Normalize) $ do
+    putStrLn ""
+  -- Prints total time
+  end <- getCPUTime
+  -- Show stats
+  when showStats $ do
+    itrs <- getItr
+    size <- getLen
+    let time = fromIntegral (end - init) / (10^12) :: Double
+    let mips = (fromIntegral itrs / 1000000.0) / time
+    printf "WORK: %llu interactions\n" itrs
+    printf "TIME: %.7f seconds\n" time
+    printf "SIZE: %llu nodes\n" size
+    printf "PERF: %.3f MIPS\n" mips
+    return ()
+  -- Finalize
+  hvmFree
+  return $ Right ()
+#206:
+genMain :: Book -> String
+genMain book =
+  let mainFid = mget (nameToId book) "main"
+      registerFuncs = unlines ["  hvm_define(" ++ show fid ++ ", " ++ mget (idToName book) fid ++ "_f);" | fid <- MS.keys (idToFunc book)]
+  in unlines
+    [ "int main() {"
+    , "  hvm_init();"
+    , registerFuncs
+    , "  clock_t start = clock();"
+    , "  Term root = term_new(REF, u12v2_new("++show mainFid++",0), 0);"
+    , "  normal(root);"
+    , "  double time = (double)(clock() - start) / CLOCKS_PER_SEC * 1000;"
+    , "  printf(\"WORK: %llu interactions\\n\", get_itr());"
+    , "  printf(\"TIME: %.3fs seconds\\n\", time / 1000.0);"
+    , "  printf(\"SIZE: %u nodes\\n\", get_len());"
+    , "  printf(\"PERF: %.3f MIPS\\n\", (get_itr() / 1000000.0) / (time / 1000.0));"
+    , "  hvm_free();"
+    , "  return 0;"
+    , "}"
+    ]
+./Parse.hs
+#207:
+#208:
+module HVML.Parse where
+#209:
+import Control.Monad (foldM, forM)
+import Control.Monad.State
+import Data.Either (isLeft)
+import Data.List
+import Data.Maybe
+import Data.Word
+import Debug.Trace
+import HVML.Show
+import HVML.Type
+import Highlight (highlightError)
+import System.Console.ANSI
+import System.Exit (exitFailure)
+import System.IO.Unsafe (unsafePerformIO)
+import Text.Parsec hiding (State)
+import Text.Parsec.Error
+import Text.Parsec.Pos
+import Text.Parsec.String
+import qualified Data.Map.Strict as MS
+#210:
+-- Core Parsers
+-- ------------
+#211:
+data ParserState = ParserState
+  { parsedCtrToAri :: MS.Map String Int
+  , parsedCtrToCid :: MS.Map String Word64
+  , freshLabel     :: Word64
+  }
+#212:
+type ParserM = Parsec String ParserState
+#213:
+parseCore :: ParserM Core
+parseCore = do
+  skip
+  head <- lookAhead anyChar
+  case head of
+#214:
+    '*' -> do
+      consume "*"
+      return Era
+#215:
+    'λ' -> do
+      consume "λ"
+      vr0 <- parseName1
+      bod <- parseCore
+      return $ Lam vr0 bod
+#216:
+    '(' -> do
+      next <- lookAhead (anyChar >> anyChar)
+      case next of
+        '+' -> parseOper OP_ADD
+        '-' -> parseOper OP_SUB
+        '*' -> parseOper OP_MUL
+        '/' -> parseOper OP_DIV
+        '%' -> parseOper OP_MOD
+        '=' -> parseOper OP_EQ
+        '!' -> parseOper OP_NE
+        '&' -> parseOper OP_AND
+        '|' -> parseOper OP_OR
+        '^' -> parseOper OP_XOR
+        '<' -> do
+          next <- lookAhead (anyChar >> anyChar >> anyChar)
+          case next of
+            '<' -> parseOper OP_LSH
+            '=' -> parseOper OP_LTE
+            _   -> parseOper OP_LT
+        '>' -> do
+          next <- lookAhead (anyChar >> anyChar >> anyChar)
+          case next of
+            '>' -> parseOper OP_RSH
+            '=' -> parseOper OP_GTE
+            _   -> parseOper OP_GT
+        _ -> do
+          consume "("
+          fun <- parseCore
+          args <- many $ do
+            closeWith ")"
+            parseCore
+          char ')'
+          return $ foldl App fun args
+#217:
+    '@' -> do
+      parseRef
+#218:
+    '&' -> do
+      consume "&"
+      name <- parseName
+      next <- optionMaybe $ try $ char '{'
+      case next of
+        Just _ -> do
+          tm0 <- parseCore
+          tm1 <- parseCore
+          consume "}"
+          if null name then do
+            num <- genFreshLabel
+            return $ Sup num tm0 tm1
+          else case reads name of
+            [(num :: Word64, "")] -> do
+              return $ Sup num tm0 tm1
+            otherwise -> do
+              return $ Ref "SUP" _SUP_F_ [Var ("&" ++ name), tm0, tm1]
+        Nothing -> do
+          return $ Var ("&" ++ name)
+#219:
+    '!' -> do
+      consume "!"
+      skip
+      next <- lookAhead anyChar
+      case next of
+#220:
+        '&' -> do
+          consume "&"
+          nam <- parseName
+          consume "{"
+          dp0 <- parseName1
+          dp1 <- parseName1
+          consume "}"
+          consume "="
+          val <- parseCore
+          bod <- parseCore
+          if null nam then do
+            num <- genFreshLabel
+            return $ Dup num dp0 dp1 val bod
+          else case reads nam of
+            [(num :: Word64, "")] -> do
+              return $ Dup num dp0 dp1 val bod
+            otherwise -> do
+              return $ Ref "DUP" _DUP_F_ [Var ("&" ++ nam), val, Lam dp0 (Lam dp1 bod)]
+#221:
+        '!' -> do
+          consume "!"
+          nam <- optionMaybe $ try $ do
+            nam <- parseName1
+            consume "="
+            return nam
+          val <- parseCore
+          bod <- parseCore
+          case nam of
+            Just nam -> return $ Let STRI nam val bod
+            Nothing  -> return $ Let STRI "_" val bod
+#222:
+        '^' -> do
+          consume "^"
+          nam <- parseName1
+          consume "="
+          val <- parseCore
+          bod <- parseCore
+          return $ Let PARA nam val bod
+#223:
+        _ -> do
+          nam <- parseName1
+          consume "="
+          val <- parseCore
+          bod <- parseCore
+          return $ Let LAZY nam val bod
+#224:
+    '#' -> parseCtr
+#225:
+    '~' -> parseMat
+#226:
+    '[' -> parseLst
+#227:
+    '\'' -> parseChr
+#228:
+    '"' -> parseStr
+#229:
+    _ -> do
+      name <- parseName1
+      case reads (filter (/= '_') name) of
+        [(num, "")] -> return $ U32 (fromIntegral (num :: Integer))
+        _           -> return $ Var name
+#230:
+parseRef :: ParserM Core
+parseRef = do
+  consume "@"
+  name <- parseName1
+  args <- option [] $ do
+    try $ string "("
+    args <- many $ do
+      closeWith ")"
+      parseCore
+    consume ")"
+    return args
+  return $ Ref name 0 args
+#231:
+parseCtr :: ParserM Core
+parseCtr = do
+  consume "#"
+  nam <- parseName1
+  cid <- if length nam == 0
+    then return 0
+    else do
+      cids <- parsedCtrToCid <$> getState
+      case MS.lookup nam cids of
+        Just id -> return id
+        Nothing -> case reads nam of
+          [(num, "")] -> return (fromIntegral (num :: Integer))
+          otherwise   -> fail $ "Unknown constructor: " ++ nam
+  fds <- option [] $ do
+    try $ consume "{"
+    fds <- many $ do
+      closeWith "}"
+      parseCore
+    consume "}"
+    return fds
+  return $ Ctr cid fds
+#232:
+parseMat :: ParserM Core
+parseMat = do
+  consume "~"
+  val <- parseCore
+  -- Parse mov (external variables)
+  mov <- many $ do
+    try $ do
+      skip
+      consume "!"
+    key <- parseName1
+    val <- optionMaybe $ do
+      try $ consume "="
+      parseCore
+    case val of
+      Just v  -> return (key, v)
+      Nothing -> return (key, Var key)
+  consume "{"
+  css <- many $ do
+    closeWith "}"
+    skip
+    next <- lookAhead anyChar
+    -- Parse constructor case
+    if next == '#' then do
+      consume "#"
+      ctr <- parseName1
+      fds <- option [] $ do
+        try $ consume "{"
+        fds <- many $ do
+          closeWith "}"
+          parseName1
+        consume "}"
+        return fds
+      consume ":"
+      bod <- parseCore
+      return (ctr, fds, bod)
+    -- Parse numeric or default case
+    else do
+      nam <- parseName1
+      case reads nam of
+        -- Numeric case
+        [(n :: Word64, "")] -> do
+          consume ":"
+          bod <- parseCore
+          return (nam, [], bod)
+        -- Default case
+        otherwise -> do
+          consume ":"
+          bod <- parseCore
+          return ("_", [nam], bod)
+  consume "}"
+  css <- forM css $ \ (ctr, fds, bod) -> do
+    cid <- case reads ctr of
+      [(num, "")] -> do
+        return $ Left (read num :: Word64)
+      otherwise -> do
+        st <- getState
+        return $ Right $ fromMaybe maxBound $ MS.lookup ctr (parsedCtrToCid st)
+    return (cid, (ctr, fds, bod))
+  css <- return $ map snd $ sortOn fst css
+  -- Transform matches with default cases into nested chain of matches
+  if length css == 1 && (let (ctr, _, _) = head css in ctr == "_") then do
+    fail "Match with only a default case is not allowed."
+  else if (let (ctr, _, _) = last css in ctr == "_") then do
+    let defName = (let (_,[nm],_) = last css in nm)
+    let ifLets  = intoIfLetChain (Var defName) mov (init css) defName (last css)
+    return $ Let LAZY defName val ifLets
+  else do
+    return $ Mat val mov css
+#233:
+intoIfLetChain :: Core -> [(String, Core)] -> [(String, [String], Core)] -> String -> (String, [String], Core) -> Core
+intoIfLetChain _ _ [] defName (_,_,defBody) = defBody
+intoIfLetChain val mov ((ctr,fds,bod):css) defName defCase =
+  let rest = intoIfLetChain val mov css defName defCase in 
+  Mat val mov [(ctr, fds, bod), ("_", [defName], rest)]
+#234:
+parseOper :: Oper -> ParserM Core
+parseOper op = do
+  consume "("
+  consume (operToString op)
+  nm0 <- parseCore
+  nm1 <- parseCore
+  consume ")"
+  return $ Op2 op nm0 nm1
+#235:
+parseEscapedChar :: ParserM Char
+parseEscapedChar = choice
+  [ try $ do
+      char '\\'
+      c <- oneOf "\\\"nrtbf0/\'"
+      return $ case c of
+        '\\' -> '\\'
+        '/'  -> '/'
+        '"'  -> '"'
+        '\'' -> '\''
+        'n'  -> '\n'
+        'r'  -> '\r'
+        't'  -> '\t'
+        'b'  -> '\b'
+        'f'  -> '\f'
+        '0'  -> '\0'
+  , try $ do
+      string "\\u"
+      code <- count 4 hexDigit
+      return $ toEnum (read ("0x" ++ code) :: Int)
+  , noneOf "\"\\"
+  ]
+#236:
+parseChr :: ParserM Core
+parseChr = do
+  skip
+  char '\''
+  c <- parseEscapedChar
+  char '\''
+  return $ Chr c
+#237:
+parseStr :: ParserM Core
+parseStr = do
+  skip
+  char '"'
+  str <- many (noneOf "\"")
+  char '"'
+  return $ foldr (\c acc -> Ctr 1 [Chr c, acc]) (Ctr 0 []) str
+#238:
+parseLst :: ParserM Core
+parseLst = do
+  skip
+  char '['
+  elems <- many $ do
+    closeWith "]"
+    parseCore
+  char ']'
+  return $ foldr (\x acc -> Ctr 1 [x, acc]) (Ctr 0 []) elems
+#239:
+parseName :: ParserM String
+parseName = skip >> many (alphaNum <|> char '_' <|> char '$' <|> char '&')
+#240:
+parseName1 :: ParserM String
+parseName1 = skip >> many1 (alphaNum <|> char '_' <|> char '$' <|> char '&')
+#241:
+parseDef :: ParserM (String, ((Bool, [(Bool, String)]), Core))
+parseDef = do
+  copy <- option False $ do
+    try $ do
+      consume "!"
+      return True
+  try $ do
+    skip
+    consume "@"
+  name <- parseName
+  args <- option [] $ do
+    try $ string "("
+    args <- many $ do
+      closeWith ")"
+      bang <- option False $ do
+        try $ do
+          consume "!"
+          return True
+      arg <- parseName
+      let strict = bang || head arg == '&'
+      return (strict, arg)
+    consume ")"
+    return args
+  skip
+  consume "="
+  core <- parseCore
+  return (name, ((copy,args), core))
+#242:
+parseADT :: ParserM ()
+parseADT = do
+  try $ do
+    skip
+    consume "data"
+  name <- parseName
+  skip
+  consume "{"
+  constructors <- many parseADTCtr
+  consume "}"
+  let ctrCids = zip (map fst constructors) [0..]
+  let ctrAris = zip (map fst constructors) (map (fromIntegral . length . snd) constructors)
+  modifyState (\s -> s { parsedCtrToCid = MS.union (MS.fromList ctrCids) (parsedCtrToCid s),
+                         parsedCtrToAri = MS.union (MS.fromList ctrAris) (parsedCtrToAri s) })
+#243:
+parseADTCtr :: ParserM (String, [String])
+parseADTCtr = do
+  skip
+  consume "#"
+  name <- parseName
+  fields <- option [] $ do
+    try $ consume "{"
+    fds <- many $ do
+      closeWith "}"
+      parseName
+    skip
+    consume "}"
+    return fds
+  skip
+  return (name, fields)
+#244:
+parseBook :: ParserM [(String, ((Bool, [(Bool,String)]), Core))]
+parseBook = do
+  skip
+  many parseADT
+  defs <- many parseDef
+  skip
+  eof
+  return defs
+#245:
+doParseCore :: String -> IO Core
+doParseCore code = case runParser parseCore (ParserState MS.empty MS.empty 0) "" code of
+  Right core -> do
+    return $ core
+  Left  err  -> do
+    showParseError "" code err
+    return $ Ref "⊥" 0 []
+#246:
+doParseBook :: String -> IO Book 
+doParseBook code = case runParser parseBookWithState (ParserState MS.empty MS.empty 0) "" code of
+  Right (defs, st) -> do
+    return $ createBook defs (parsedCtrToCid st) (parsedCtrToAri st)
+  Left err -> do
+    showParseError "" code err
+    return $ Book MS.empty MS.empty MS.empty MS.empty MS.empty MS.empty
+  where
+    parseBookWithState :: ParserM ([(String, ((Bool,[(Bool,String)]), Core))], ParserState)
+    parseBookWithState = do
+      defs <- parseBook
+      st <- getState
+      return (defs, st)
+#247:
+-- Helper Parsers
+-- --------------
+#248:
+consume :: String -> ParserM String
+consume str = skip >> string str
+#249:
+closeWith :: String -> ParserM ()
+closeWith str = try $ do
+  skip
+  notFollowedBy (string str)
+#250:
+skip :: ParserM ()
+skip = skipMany (parseSpace <|> parseComment) where
+  parseSpace = (try $ do
+    space
+    return ()) <?> "space"
+  parseComment = (try $ do
+    string "//"
+    skipMany (noneOf "\n")
+    char '\n'
+    return ()) <?> "Comment"
+#251:
+genFreshLabel :: ParserM Word64
+genFreshLabel = do
+  st <- getState
+  let lbl = freshLabel st
+  putState st { freshLabel = lbl + 1 }
+  return $ lbl + 0x800000
+#252:
+-- Adjusting
+-- ---------
+#253:
+createBook :: [(String, ((Bool,[(Bool,String)]), Core))] -> MS.Map String Word64 -> MS.Map String Int -> Book
+createBook defs ctrToCid ctrToAri =
+  let withPrims = \n2i -> MS.union n2i $ MS.fromList primitives
+      nameToId' = withPrims $ MS.fromList $ zip (map fst defs) [0..]
+      idToName' = MS.fromList $ map (\(k,v) -> (v,k)) $ MS.toList nameToId'
+      idToFunc' = MS.fromList $ map (\(name, ((copy,args), core)) -> (mget nameToId' name, ((copy,args), lexify (setRefIds nameToId' core)))) defs
+      idToLabs' = MS.fromList $ map (\(name, (_, core)) -> (mget nameToId' name, collectLabels core)) defs
+  in Book idToFunc' idToName' idToLabs' nameToId' ctrToAri ctrToCid
+#254:
+-- Adds the function id to Ref constructors
+setRefIds :: MS.Map String Word64 -> Core -> Core
+setRefIds fids term = case term of
+  Var nam       -> Var nam
+  Let m x v b   -> Let m x (setRefIds fids v) (setRefIds fids b)
+  Lam x bod     -> Lam x (setRefIds fids bod)
+  App f x       -> App (setRefIds fids f) (setRefIds fids x)
+  Sup l x y     -> Sup l (setRefIds fids x) (setRefIds fids y)
+  Dup l x y v b -> Dup l x y (setRefIds fids v) (setRefIds fids b)
+  Ctr cid fds   -> Ctr cid (map (setRefIds fids) fds)
+  Mat x mov css -> Mat (setRefIds fids x) (map (\ (k,v) -> (k, setRefIds fids v)) mov) (map (\ (ctr,fds,cs) -> (ctr, fds, setRefIds fids cs)) css)
+  Op2 op x y    -> Op2 op (setRefIds fids x) (setRefIds fids y)
+  U32 n         -> U32 n
+  Chr c         -> Chr c
+  Era           -> Era
+  Ref nam _ arg -> case MS.lookup nam fids of
+    Just fid -> Ref nam fid (map (setRefIds fids) arg)
+    Nothing  -> unsafePerformIO $ do
+      putStrLn $ "error:unbound-ref @" ++ nam
+      exitFailure
+#255:
+-- Collects all SUP/DUP labels used
+collectLabels :: Core -> MS.Map Word64 ()
+collectLabels term = case term of
+  Var _               -> MS.empty
+  U32 _               -> MS.empty
+  Chr _               -> MS.empty
+  Era                 -> MS.empty
+  Ref _ _ args        -> MS.unions $ map collectLabels args
+  Let _ _ val bod     -> MS.union (collectLabels val) (collectLabels bod)
+  Lam _ bod           -> collectLabels bod
+  App fun arg         -> MS.union (collectLabels fun) (collectLabels arg)
+  Sup lab tm0 tm1     -> MS.insert lab () $ MS.union (collectLabels tm0) (collectLabels tm1)
+  Dup lab _ _ val bod -> MS.insert lab () $ MS.union (collectLabels val) (collectLabels bod)
+  Ctr _ fds           -> MS.unions $ map collectLabels fds
+  Mat val mov css     -> MS.unions $ collectLabels val : map (collectLabels . snd) mov ++ map (\(_,_,bod) -> collectLabels bod) css
+  Op2 _ x y           -> MS.union (collectLabels x) (collectLabels y)
+#256:
+-- Gives unique names to lexically scoped vars, unless they start with '$'.
+-- Example: `λx λt (t λx(x) x)` will read as `λx0 λt1 (t1 λx2(x2) x0)`.
+lexify :: Core -> Core
+lexify term = evalState (go term MS.empty) 0 where
+  fresh :: String -> State Int String
+  fresh nam@('$':_) = return $ nam
+  fresh nam         = do i <- get; put (i+1); return $ nam++"$"++show i
+#257:
+  extend :: String -> String -> MS.Map String String -> State Int (MS.Map String String)
+  extend old@('$':_) new ctx = return $ ctx
+  extend old         new ctx = return $ MS.insert old new ctx
+#258:
+  go :: Core -> MS.Map String String -> State Int Core
+#259:
+  go term ctx = case term of
+#260:
+    Var nam -> 
+      return $ Var (MS.findWithDefault nam nam ctx)
+#261:
+    Ref nam fid arg -> do
+      arg <- mapM (\x -> go x ctx) arg
+      return $ Ref nam fid arg
+#262:
+    Let mod nam val bod -> do
+      val  <- go val ctx
+      nam' <- fresh nam
+      ctx  <- extend nam nam' ctx
+      bod  <- go bod ctx
+      return $ Let mod nam' val bod
+#263:
+    Lam nam bod -> do
+      nam' <- fresh nam
+      ctx  <- extend nam nam' ctx
+      bod  <- go bod ctx
+      return $ Lam nam' bod
+#264:
+    App fun arg -> do
+      fun <- go fun ctx
+      arg <- go arg ctx
+      return $ App fun arg
+#265:
+    Sup lab tm0 tm1 -> do
+      tm0 <- go tm0 ctx
+      tm1 <- go tm1 ctx
+      return $ Sup lab tm0 tm1
+#266:
+    Dup lab dp0 dp1 val bod -> do
+      val  <- go val ctx
+      dp0' <- fresh dp0
+      dp1' <- fresh dp1
+      ctx  <- extend dp0 dp0' ctx
+      ctx  <- extend dp1 dp1' ctx
+      bod  <- go bod ctx
+      return $ Dup lab dp0' dp1' val bod
+#267:
+    Ctr cid fds -> do
+      fds <- mapM (\x -> go x ctx) fds
+      return $ Ctr cid fds
+#268:
+    Mat val mov css -> do
+      val' <- go val ctx
+      mov' <- forM mov $ \ (k,v) -> do
+        k' <- fresh k
+        v  <- go v ctx
+        return $ (k', v)
+      css' <- forM css $ \ (ctr,fds,bod) -> do
+        fds' <- mapM fresh fds
+        ctx  <- foldM (\ ctx (fd,fd') -> extend fd fd' ctx) ctx (zip fds fds')
+        ctx  <- foldM (\ ctx ((k,_),(k',_)) -> extend k k' ctx) ctx (zip mov mov')
+        bod <- go bod ctx
+        return (ctr, fds', bod)
+      return $ Mat val' mov' css'
+#269:
+    Op2 op nm0 nm1 -> do
+      nm0 <- go nm0 ctx
+      nm1 <- go nm1 ctx
+      return $ Op2 op nm0 nm1
+#270:
+    U32 n -> 
+      return $ U32 n
+#271:
+    Chr c ->
+      return $ Chr c
+#272:
+    Era -> 
+      return Era
+#273:
+-- Errors
+-- ------
+#274:
+-- Error handling
+extractExpectedTokens :: ParseError -> String
+extractExpectedTokens err =
+    let expectedMsgs = [msg | Expect msg <- errorMessages err, msg /= "space", msg /= "Comment"]
+    in intercalate " | " expectedMsgs
+#275:
+showParseError :: String -> String -> ParseError -> IO ()
+showParseError filename input err = do
+  let pos = errorPos err
+  let lin = sourceLine pos
+  let col = sourceColumn pos
+  let errorMsg = extractExpectedTokens err
+  putStrLn $ setSGRCode [SetConsoleIntensity BoldIntensity] ++ "\nPARSE_ERROR" ++ setSGRCode [Reset]
+  putStrLn $ "- expected: " ++ errorMsg
+  putStrLn $ "- detected:"
+  putStrLn $ highlightError (lin, col) (lin, col + 1) input
+  putStrLn $ setSGRCode [SetUnderlining SingleUnderline] ++ filename ++ setSGRCode [Reset]
+./Reduce.hs
+#276:
+#277:
+module HVML.Reduce where
+#278:
+import Control.Monad (when, forM, forM_)
+import Data.Word
+import HVML.Collapse
+import HVML.Extract
+import HVML.Inject
+import HVML.Show
+import HVML.Type
+import System.Exit
+import qualified Data.Map.Strict as MS
+#279:
+reduceAt :: Bool -> ReduceAt
+#280:
+reduceAt debug book host = do 
+  term <- got host
+  let tag = termTag term
+  let lab = termLab term
+  let loc = termLoc term
+#281:
+  when debug $ do
+    root <- doExtractCoreAt (const got) book 0
+    core <- doExtractCoreAt (const got) book host
+    putStrLn $ "reduce: " ++ termToString term
+    -- putStrLn $ "---------------- CORE: "
+    -- putStrLn $ coreToString core
+    putStrLn $ "---------------- ROOT: "
+    putStrLn $ coreToString (doLiftDups root)
+#282:
+  case tagT tag of
+#283:
+    LET -> do
+      case modeT lab of
+        LAZY -> do
+          val <- got (loc + 0)
+          cont host (reduceLet term val)
+        STRI -> do
+          val <- reduceAt debug book (loc + 0)
+          cont host (reduceLet term val)
+        PARA -> do
+          error "TODO"
+#284:
+    APP -> do
+      fun <- reduceAt debug book (loc + 0)
+      case tagT (termTag fun) of
+        ERA -> cont host (reduceAppEra term fun)
+        LAM -> cont host (reduceAppLam term fun)
+        SUP -> cont host (reduceAppSup term fun)
+        CTR -> cont host (reduceAppCtr term fun)
+        W32 -> cont host (reduceAppW32 term fun)
+        CHR -> cont host (reduceAppW32 term fun)
+        _   -> set (loc + 0) fun >> return term
+#285:
+    MAT -> do
+      val <- reduceAt debug book (loc + 0)
+      case tagT (termTag val) of
+        ERA -> cont host (reduceMatEra term val)
+        LAM -> cont host (reduceMatLam term val)
+        SUP -> cont host (reduceMatSup term val)
+        CTR -> cont host (reduceMatCtr term val)
+        W32 -> cont host (reduceMatW32 term val)
+        CHR -> cont host (reduceMatW32 term val)
+        _   -> set (loc + 0) val >> return term
+#286:
+    OPX -> do
+      val <- reduceAt debug book (loc + 0)
+      case tagT (termTag val) of
+        ERA -> cont host (reduceOpxEra term val)
+        LAM -> cont host (reduceOpxLam term val)
+        SUP -> cont host (reduceOpxSup term val)
+        CTR -> cont host (reduceOpxCtr term val)
+        W32 -> cont host (reduceOpxW32 term val)
+        CHR -> cont host (reduceOpxW32 term val)
+        _   -> set (loc + 0) val >> return term
+#287:
+    OPY -> do
+      val <- reduceAt debug book (loc + 1)
+      case tagT (termTag val) of
+        ERA -> cont host (reduceOpyEra term val)
+        LAM -> cont host (reduceOpyLam term val)
+        SUP -> cont host (reduceOpySup term val)
+        CTR -> cont host (reduceOpyCtr term val)
+        W32 -> cont host (reduceOpyW32 term val)
+        CHR -> cont host (reduceOpyW32 term val)
+        _   -> set (loc + 1) val >> return term
+#288:
+    DP0 -> do
+      sb0 <- got (loc + 0)
+      if termGetBit sb0 == 0
+        then do
+          val <- reduceAt debug book (loc + 0)
+          case tagT (termTag val) of
+            ERA -> cont host (reduceDupEra term val)
+            LAM -> cont host (reduceDupLam term val)
+            SUP -> cont host (reduceDupSup term val)
+            CTR -> cont host (reduceDupCtr term val)
+            W32 -> cont host (reduceDupW32 term val)
+            CHR -> cont host (reduceDupW32 term val)
+            _   -> set (loc + 0) val >> return term
+        else do
+          set host (termRemBit sb0)
+          reduceAt debug book host
+#289:
+    DP1 -> do
+      sb1 <- got (loc + 1)
+      if termGetBit sb1 == 0
+        then do
+          val <- reduceAt debug book (loc + 0)
+          case tagT (termTag val) of
+            ERA -> cont host (reduceDupEra term val)
+            LAM -> cont host (reduceDupLam term val)
+            SUP -> cont host (reduceDupSup term val)
+            CTR -> cont host (reduceDupCtr term val)
+            W32 -> cont host (reduceDupW32 term val)
+            CHR -> cont host (reduceDupW32 term val)
+            _   -> set (loc + 0) val >> return term
+        else do
+          set host (termRemBit sb1)
+          reduceAt debug book host
+#290:
+    VAR -> do
+      sub <- got (loc + 0)
+      if termGetBit sub == 0
+        then return term
+        else do
+          set host (termRemBit sub)
+          reduceAt debug book host
+#291:
+    REF -> do
+      reduceRefAt book host
+      reduceAt debug book host
+#292:
+    otherwise -> do
+      return term
+#293:
+  where
+    cont host action = do
+      ret <- action
+      set host ret
+      reduceAt debug book host
+#294:
+reduceRefAt :: Book -> Loc -> HVM Term
+reduceRefAt book host = do
+  term <- got host
+  let lab = termLab term
+  let loc = termLoc term
+  let fid = u12v2X lab
+  let ari = u12v2Y lab
+  case fid of
+    x | x == _DUP_F_ -> reduceRefAt_DupF book host loc ari
+    x | x == _SUP_F_ -> reduceRefAt_SupF book host loc ari
+    x | x == _LOG_F_ -> reduceRefAt_LogF book host loc ari
+    x | x == _FRESH_F_ -> reduceRefAt_FreshF book host loc ari
+    oterwise -> case MS.lookup fid (idToFunc book) of
+      Just ((copy, args), core) -> do
+        incItr
+        when (length args /= fromIntegral ari) $ do
+          putStrLn $ "RUNTIME_ERROR: arity mismatch on call to '@" ++ mget (idToName book) fid ++ "'."
+          exitFailure
+        argTerms <- if ari == 0
+          then return [] 
+          else forM (zip [0..] args) $ \(i, (strict, _)) -> do
+            term <- got (loc + i)
+            if strict
+              then reduceAt False book (loc + i)
+              else return term
+        doInjectCoreAt book core host $ zip (map snd args) argTerms
+        -- TODO: I disabled Fast Copy Optimization on interpreted mode because I
+        -- don't think it is relevant here. We use it for speed, to trigger the
+        -- hot paths on compiled functions, which don't happen when interpreted.
+        -- I think leaving it out is good because it ensures interpreted mode is
+        -- always optimal (minimizing interactions). This also allows the dev to
+        -- see how Fast Copy Mode affects the interaction count.
+        -- let inject = doInjectCoreAt book core host $ zip (map snd args) argTerms
+        -- Fast Copy Optimization
+        -- if copy then do
+          -- let supGet = \x (idx,sup) -> if tagT (termTag sup) == SUP then Just (idx,sup) else x
+          -- let supGot = foldl' supGet Nothing $ zip [0..] argTerms
+          -- case supGot of
+            -- Just (idx,sup) -> do
+              -- let isCopySafe = case MS.lookup fid (idToLabs book) of
+                    -- Nothing   -> False
+                    -- Just labs -> not $ MS.member (termLab sup) labs
+              -- if isCopySafe then do
+                -- term <- reduceRefSup term idx
+                -- set host term
+                -- return term
+              -- else inject
+            -- otherwise -> inject
+        -- else inject
+      Nothing -> do
+        return term
+#295:
+-- Primitive: Dynamic Dup `@DUP(lab val λdp0λdp1(bod))`
+reduceRefAt_DupF :: Book -> Loc -> Loc -> Word64 -> HVM Term  
+reduceRefAt_DupF book host loc ari = do
+  incItr
+  when (ari /= 3) $ do
+    putStrLn $ "RUNTIME_ERROR: arity mismatch on call to '@DUP'."
+    exitFailure
+  lab <- reduceAt False book (loc + 0)
+  val <- got (loc + 1)
+  bod <- got (loc + 2)
+  dup <- allocNode 2
+  case tagT (termTag lab) of
+    W32 -> do
+      when (termLoc lab >= 0x1000000) $ do
+        error "RUNTIME_ERROR: dynamic DUP label too large"
+      -- Create the DUP node with value and SUB
+      set (dup + 0) val
+      set (dup + 1) (termNew _SUB_ 0 0)
+      -- Create first APP node for (APP bod DP0)
+      app1 <- allocNode 2
+      set (app1 + 0) bod
+      set (app1 + 1) (termNew _DP0_ (termLoc lab) dup)
+      -- Create second APP node for (APP (APP bod DP0) DP1)
+      app2 <- allocNode 2
+      set (app2 + 0) (termNew _APP_ 0 app1)
+      set (app2 + 1) (termNew _DP1_ (termLoc lab) dup)
+      let ret = termNew _APP_ 0 app2
+      set host ret
+      return ret
+    _ -> do
+      core <- doExtractCoreAt (\ x -> got) book (loc + 0)
+      putStrLn $ "RUNTIME_ERROR: dynamic DUP without numeric label: " ++ termToString lab
+      putStrLn $ coreToString (doLiftDups core)
+      exitFailure
+#296:
+-- Primitive: Dynamic Sup `@SUP(lab tm0 tm1)`
+reduceRefAt_SupF :: Book -> Loc -> Loc -> Word64 -> HVM Term
+reduceRefAt_SupF book host loc ari = do
+  incItr
+  when (ari /= 3) $ do
+    putStrLn $ "RUNTIME_ERROR: arity mismatch on call to '@SUP'."
+    exitFailure
+  lab <- reduceAt False book (loc + 0)
+  tm0 <- got (loc + 1)
+  tm1 <- got (loc + 2)
+  sup <- allocNode 2
+  case tagT (termTag lab) of
+    W32 -> do
+      when (termLoc lab >= 0x1000000) $ do
+        error "RUNTIME_ERROR: dynamic SUP label too large"
+      let ret = termNew _SUP_ (termLoc lab) sup
+      set (sup + 0) tm0
+      set (sup + 1) tm1
+      set host ret
+      return ret
+    _ -> error "RUNTIME_ERROR: dynamic SUP without numeric label."
+#297:
+-- Primitive: Logger `@LOG(msg)`
+-- Will extract the term and log it. 
+-- Returns 0.
+reduceRefAt_LogF :: Book -> Loc -> Loc -> Word64 -> HVM Term
+reduceRefAt_LogF book host loc ari = do
+  incItr
+  when (ari /= 1) $ do
+    putStrLn $ "RUNTIME_ERROR: arity mismatch on call to '@LOG'."
+    exitFailure
+  msg <- doExtractCoreAt (const got) book (loc + 0)
+  putStrLn $ coreToString (doLiftDups msg)
+  -- msgs <- doCollapseFlatAt (const got) book (loc + 0)
+  -- forM_ msgs $ \msg -> do
+    -- putStrLn $ coreToString msg
+  let ret = termNew _W32_ 0 0
+  set host ret
+  return ret
+#298:
+-- Primitive: Fresh `@FRESH`
+-- Returns a fresh dup label.
+reduceRefAt_FreshF :: Book -> Loc -> Loc -> Word64 -> HVM Term
+reduceRefAt_FreshF book host loc ari = do
+  incItr
+  when (ari /= 0) $ do
+    putStrLn $ "RUNTIME_ERROR: arity mismatch on call to '@Fresh'."
+    exitFailure
+  num <- fresh
+  let ret = termNew _W32_ 0 num
+  set host ret
+  return ret
+#299:
+reduceCAt :: Bool -> ReduceAt
+reduceCAt = \ _ _ host -> do
+  term <- got host
+  whnf <- reduceC term
+  set host whnf
+  return $ whnf
+#300:
+-- normalAtWith :: (Book -> Term -> HVM Term) -> Book -> Loc -> HVM Term
+-- normalAtWith reduceAt book host = do
+  -- term <- got host
+  -- if termBit term == 1 then do
+    -- return term
+  -- else do
+    -- whnf <- reduceAt book host
+    -- set host $ termSetBit whnf
+    -- let tag = termTag whnf
+    -- let lab = termLab whnf
+    -- let loc = termLoc whnf
+    -- case tagT tag of
+      -- APP -> do
+        -- normalAtWith reduceAt book (loc + 0)
+        -- normalAtWith reduceAt book (loc + 1)
+        -- return whnf
+      -- LAM -> do
+        -- normalAtWith reduceAt book (loc + 1)
+        -- return whnf
+      -- SUP -> do
+        -- normalAtWith reduceAt book (loc + 0)
+        -- normalAtWith reduceAt book (loc + 1)
+        -- return whnf
+      -- DP0 -> do
+        -- normalAtWith reduceAt book (loc + 0)
+        -- return whnf
+      -- DP1 -> do
+        -- normalAtWith reduceAt book (loc + 0)
+        -- return whnf
+      -- CTR -> do
+        -- let ari = u12v2Y lab
+        -- let ars = (if ari == 0 then [] else [0 .. ari - 1]) :: [Word64]
+        -- mapM_ (\i -> normalAtWith reduceAt book (loc + i)) ars
+        -- return whnf
+      -- MAT -> do
+        -- let ari = lab
+        -- let ars = [0 .. ari] :: [Word64]
+        -- mapM_ (\i -> normalAtWith reduceAt book (loc + i)) ars
+        -- return whnf
+      -- _ -> do
+        -- return whnf
+#301:
+-- normalAt :: Book -> Loc -> HVM Term
+-- normalAt = normalAtWith (reduceAt False)
+#302:
+-- normalCAt :: Book -> Loc -> HVM Term
+-- normalCAt = normalAtWith (reduceCAt False)
+./Runtime.c
+#303:
+#304:
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <time.h>
+#305:
+typedef uint8_t  Tag;
+typedef uint32_t Lab;
+typedef uint32_t Loc;
+typedef uint64_t Term;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef _Atomic(Term) ATerm;
+#306:
+// Runtime Types
+// -------------
+#307:
+// Global State Type
+typedef struct {
+  Term*  sbuf; // reduction stack buffer
+  u64*   spos; // reduction stack position
+  ATerm* heap; // global node buffer
+  u64*   size; // global node length
+  u64*   itrs; // interaction count
+  u64*   frsh; // fresh dup label count
+  Term (*book[4096])(Term); // functions
+} State;
+#308:
+// Global State Value
+static State HVM = {
+  .sbuf = NULL,
+  .spos = NULL,
+  .heap = NULL,
+  .size = NULL,
+  .itrs = NULL,
+  .frsh = NULL,
+  .book = {NULL}
+};
+#309:
+// Constants
+// ---------
+#310:
+#define DP0 0x00
+#define DP1 0x01
+#define VAR 0x02
+#define SUB 0x03
+#define REF 0x04
+#define LET 0x05
+#define APP 0x06
+#define MAT 0x08
+#define OPX 0x09
+#define OPY 0x0A
+#define ERA 0x0B
+#define LAM 0x0C
+#define SUP 0x0D
+#define CTR 0x0F
+#define W32 0x10
+#define CHR 0x11
+#311:
+#define OP_ADD 0x00
+#define OP_SUB 0x01
+#define OP_MUL 0x02
+#define OP_DIV 0x03
+#define OP_MOD 0x04
+#define OP_EQ  0x05
+#define OP_NE  0x06
+#define OP_LT  0x07
+#define OP_GT  0x08
+#define OP_LTE 0x09
+#define OP_GTE 0x0A
+#define OP_AND 0x0B
+#define OP_OR  0x0C
+#define OP_XOR 0x0D
+#define OP_LSH 0x0E
+#define OP_RSH 0x0F
+#312:
+#define DUP_F 0xFFF
+#define SUP_F 0xFFE
+#define LOG_F 0xFFD
+#define FRESH_F 0xFFC
+#313:
+#define LAZY 0x0
+#define STRI 0x1
+#define PARA 0x2
+#314:
+#define VOID 0x00000000000000
+#315:
+// Heap
+// ----
+#316:
+Loc get_len() {
+  return *HVM.size;
+}
+#317:
+u64 get_itr() {
+  return *HVM.itrs;
+}
+#318:
+u64 fresh() {
+  return (*HVM.frsh)++;
+}
+#319:
+void set_len(Loc value) {
+  *HVM.size = value;
+}
+#320:
+void set_itr(Loc value) {
+  *HVM.itrs = value;
+}
+#321:
+// Terms
+// ------
+#322:
+Term term_new(Tag tag, Lab lab, Loc loc) {
+  Term tag_enc = tag;
+  Term lab_enc = ((Term)lab) << 8;
+  Term loc_enc = ((Term)loc) << 32;
+  return tag_enc | lab_enc | loc_enc;
+}
+#323:
+Tag term_tag(Term x) {
+  return x & 0x7F;
+}
+#324:
+Lab term_lab(Term x) {
+  return (x >> 8) & 0xFFFFFF;
+}
+#325:
+Loc term_loc(Term x) {
+  return (x >> 32) & 0xFFFFFFFF;
+}
+#326:
+Tag term_get_bit(Term x) {
+  return (x >> 7) & 1;
+}
+#327:
+Term term_set_bit(Term term) {
+  return term | (1ULL << 7);
+}
+#328:
+Term term_rem_bit(Term term) {
+  return term & ~(1ULL << 7);
+#329:
+}
+#330:
+// u12v2
+// -----
+#331:
+u64 u12v2_new(u64 x, u64 y) {
+  return (y << 12) | x;
+}
+#332:
+u64 u12v2_x(u64 u12v2) {
+  return u12v2 & 0xFFF;
+}
+#333:
+u64 u12v2_y(u64 u12v2) {
+  return u12v2 >> 12;
+}
+#334:
+// Atomics
+// -------
+#335:
+Term swap(Loc loc, Term term) {
+  Term val = atomic_exchange_explicit(&HVM.heap[loc], term, memory_order_relaxed);
+  if (val == 0) {
+    printf("SWAP 0 at %x\n", loc);
+    exit(0);
+  }
+  return val;
+}
+#336:
+Term got(Loc loc) {
+  Term val = atomic_load_explicit(&HVM.heap[loc], memory_order_relaxed);
+  if (val == 0) {
+    printf("GOT 0 at %x\n", loc);
+    exit(0);
+  }
+  return val;
+}
+#337:
+void set(Loc loc, Term term) {
+  atomic_store_explicit(&HVM.heap[loc], term, memory_order_relaxed);
+}
+#338:
+void sub(Loc loc, Term term) {
+  set(loc, term_set_bit(term));
+}
+#339:
+Term take(Loc loc) {
+  return swap(loc, VOID);
+}
+#340:
+// Allocation
+// ----------
+#341:
+Loc alloc_node(Loc arity) {
+  u64 old = *HVM.size;
+  *HVM.size += arity;
+  return old;
+}
+#342:
+Loc inc_itr() {
+  u64 old = *HVM.itrs;
+  *HVM.itrs += 1;
+  return old;
+}
+#343:
+// Stringification
+// ---------------
+#344:
+void print_tag(Tag tag) {
+  switch (tag) {
+    case SUB: printf("SUB"); break;
+    case VAR: printf("VAR"); break;
+    case DP0: printf("DP0"); break;
+    case DP1: printf("DP1"); break;
+    case APP: printf("APP"); break;
+    case LAM: printf("LAM"); break;
+    case ERA: printf("ERA"); break;
+    case SUP: printf("SUP"); break;
+    case REF: printf("REF"); break;
+    case LET: printf("LET"); break;
+    case CTR: printf("CTR"); break;
+    case MAT: printf("MAT"); break;
+    case W32: printf("W32"); break;
+    case CHR: printf("CHR"); break;
+    case OPX: printf("OPX"); break;
+    case OPY: printf("OPY"); break;
+    default : printf("???"); break;
+  }
+}
+#345:
+void print_term(Term term) {
+  printf("term_new(");
+  print_tag(term_tag(term));
+  printf(",0x%06x,0x%09x)", term_lab(term), term_loc(term));
+}
+#346:
+void print_term_ln(Term term) {
+  print_term(term);
+  printf("\n");
+}
+#347:
+void print_heap() {
+  Loc len = get_len();
+  for (Loc i = 0; i < len; i++) {
+    Term term = got(i);
+    if (term != 0) {
+      printf("set(0x%09x, ", i);
+      print_term(term);
+      printf(");\n");
+    }
+  }
+}
+#348:
+// Evaluation
+// ----------
+#349:
+// @foo(&L{ax ay} b c ...)
+// ----------------------- REF-SUP-COPY (when @L not in @foo)
+// ! &L{bx by} = b
+// ! &L{cx cy} = b
+// ...
+// &L{@foo(ax bx cx ...) @foo(ay by cy ...)}
+Term reduce_ref_sup(Term ref, u32 idx) {
+  inc_itr();
+  Loc ref_loc = term_loc(ref);
+  Lab ref_lab = term_lab(ref);
+  u64 fun_id = u12v2_x(ref_lab);
+  u64 arity  = u12v2_y(ref_lab);
+  if (idx >= arity) {
+    printf("ERROR: Invalid index in reduce_ref_sup\n");
+    exit(1);
+  }
+  Term sup = got(ref_loc + idx);
+  if (term_tag(sup) != SUP) {
+    printf("ERROR: Expected SUP at index %u\n", idx);
+    exit(1);
+  }
+  Lab sup_lab = term_lab(sup);
+  Loc sup_loc = term_loc(sup);
+  Term sup0 = got(sup_loc + 0);
+  Term sup1 = got(sup_loc + 1);
+  // Allocate space for new REF node arguments for the second branch
+  Loc ref1_loc = alloc_node(arity);
+  for (u64 i = 0; i < arity; ++i) {
+    if (i != idx) {
+      // Duplicate argument
+      Term arg = got(ref_loc + i);
+      Loc dup_loc = alloc_node(2);
+      set(dup_loc + 0, arg);
+      set(dup_loc + 1, term_new(SUB, 0, 0));
+      set(ref_loc + i, term_new(DP0, sup_lab, dup_loc));
+      set(ref1_loc + i, term_new(DP1, sup_lab, dup_loc));
+    } else {
+      // Set the SUP components directly
+      set(ref_loc + i, sup0);
+      set(ref1_loc + i, sup1);
+    }
+  }
+  // Create new REF nodes
+  Term ref0 = term_new(REF, ref_lab, ref_loc);
+  Term ref1 = term_new(REF, ref_lab, ref1_loc);
+  // Reuse sup_loc to create the new SUP node
+  set(sup_loc + 0, ref0);
+  set(sup_loc + 1, ref1);
+  return term_new(SUP, sup_lab, sup_loc);
+}
+#350:
+// @foo(a b c ...)
+// -------------------- REF
+// book[foo](a b c ...)
+Term reduce_ref(Term ref) {
+  //printf("reduce_ref "); print_term(ref); printf("\n");
+  //printf("call %d %p\n", term_loc(ref), HVM.book[term_loc(ref)]);
+  inc_itr();
+  return HVM.book[u12v2_x(term_lab(ref))](ref);
+}
+#351:
+// ! x = val
+// bod
+// --------- LET
+// x <- val
+// bod
+Term reduce_let(Term let, Term val) {
+  //printf("reduce_let "); print_term(let); printf("\n");
+  inc_itr();
+  Loc let_loc = term_loc(let);
+  Term bod    = got(let_loc + 1);
+  sub(let_loc + 0, val);
+  return bod;
+}
+#352:
+// (* a)
+// ----- APP-ERA
+// *
+Term reduce_app_era(Term app, Term era) {
+  //printf("reduce_app_era "); print_term(app); printf("\n");
+  inc_itr();
+  return era;
+}
+#353:
+// (λx(body) a)
+// ------------ APP-LAM
+// x <- a
+// body
+Term reduce_app_lam(Term app, Term lam) {
+  //printf("reduce_app_lam "); print_term(app); printf("\n");
+  inc_itr();
+  Loc app_loc = term_loc(app);
+  Loc lam_loc = term_loc(lam);
+  Term arg    = got(app_loc + 1);
+  Term bod    = got(lam_loc + 0);
+  sub(lam_loc + 0, arg);
+  return bod;
+}
+#354:
+// (&L{a b} c)
+// ----------------- APP-SUP
+// ! &L{x0 x1} = c
+// &L{(a x0) (b x1)}
+Term reduce_app_sup(Term app, Term sup) {
+  //printf("reduce_app_sup "); print_term(app); printf("\n");
+  inc_itr();
+  Loc app_loc = term_loc(app);
+  Loc sup_loc = term_loc(sup);
+  Lab sup_lab = term_lab(sup);
+  Term arg    = got(app_loc + 1);
+  Term tm0    = got(sup_loc + 0);
+  Term tm1    = got(sup_loc + 1);
+  Loc du0     = alloc_node(2);
+  //Loc su0     = alloc_node(2);
+  //Loc ap0     = alloc_node(2);
+  Loc ap0     = app_loc;
+  Loc su0     = sup_loc;
+  Loc ap1     = alloc_node(2);
+  set(du0 + 0, arg);
+  set(du0 + 1, term_new(SUB, 0, 0));
+  set(ap0 + 0, tm0);
+  set(ap0 + 1, term_new(DP0, sup_lab, du0));
+  set(ap1 + 0, tm1);
+  set(ap1 + 1, term_new(DP1, sup_lab, du0));
+  set(su0 + 0, term_new(APP, 0, ap0));
+  set(su0 + 1, term_new(APP, 0, ap1));
+  return term_new(SUP, sup_lab, su0);
+}
+#355:
+// (#{x y z ...} a)
+// ---------------- APP-CTR
+// ⊥
+Term reduce_app_ctr(Term app, Term ctr) {
+  //printf("reduce_app_ctr "); print_term(app); printf("\n");
+  printf("invalid:app-ctr");
+  exit(0);
+}
+#356:
+// (123 a)
+// ------- APP-W32
+// ⊥
+Term reduce_app_w32(Term app, Term w32) {
+  //printf("reduce_app_w32 "); print_term(app); printf("\n");
+  printf("invalid:app-w32");
+  exit(0);
+}
+#357:
+// ! &L{x y} = *
+// ------------- DUP-ERA
+// x <- *
+// y <- *
+Term reduce_dup_era(Term dup, Term era) {
+  //printf("reduce_dup_era "); print_term(dup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  sub(dup_loc + 0, era);
+  sub(dup_loc + 1, era);
+  return term_rem_bit(got(dup_loc + dup_num));
+}
+#358:
+// ! &L{r s} = λx(f)
+// ----------------- DUP-LAM
+// ! &L{f0 f1} = f
+// r <- λx0(f0)
+// s <- λx1(f1)
+// x <- &L{x0 x1}
+Term reduce_dup_lam(Term dup, Term lam) {
+  //printf("reduce_dup_lam "); print_term(dup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Lab dup_lab = term_lab(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  Loc lam_loc = term_loc(lam);
+  Term bod    = got(lam_loc + 0);
+  Loc du0     = alloc_node(2);
+  Loc lm0     = alloc_node(1);
+  Loc lm1     = alloc_node(1);
+  Loc su0     = alloc_node(2);
+  set(du0 + 0, bod);
+  set(du0 + 1, term_new(SUB, 0, 0));
+  //set(lm0 + 0, term_new(SUB, 0, 0));
+  set(lm0 + 0, term_new(DP0, dup_lab, du0));
+  //set(lm1 + 0, term_new(SUB, 0, 0));
+  set(lm1 + 0, term_new(DP1, dup_lab, du0));
+  set(su0 + 0, term_new(VAR, 0, lm0));
+  set(su0 + 1, term_new(VAR, 0, lm1));
+  sub(dup_loc + 0, term_new(LAM, 0, lm0));
+  sub(dup_loc + 1, term_new(LAM, 0, lm1));
+  sub(lam_loc + 0, term_new(SUP, dup_lab, su0));
+  return term_rem_bit(got(dup_loc + dup_num));
+}
+#359:
+// ! &L{x y} = &R{a b}
+// ------------------- DUP-SUP
+// if L == R:
+//   x <- a
+//   y <- b
+// else:
+//   x <- &R{a0 b0} 
+//   y <- &R{a1 b1}
+//   ! &L{a0 a1} = a
+//   ! &L{b0 b1} = b
+Term reduce_dup_sup(Term dup, Term sup) {
+  //printf("reduce_dup_sup %u %u | %llu ", term_lab(dup), term_lab(sup), *HVM.spos); print_term(dup); printf(" "); print_term(sup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Lab dup_lab = term_lab(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  Lab sup_lab = term_lab(sup);
+  Loc sup_loc = term_loc(sup);
+  if (dup_lab == sup_lab) {
+    Term tm0 = got(sup_loc + 0);
+    Term tm1 = got(sup_loc + 1);
+    sub(dup_loc + 0, tm0);
+    sub(dup_loc + 1, tm1);
+    return term_rem_bit(got(dup_loc + dup_num));
+  } else {
+    Loc du0 = alloc_node(2);
+    Loc du1 = alloc_node(2);
+    //Loc su0 = alloc_node(2);
+    Loc su0 = sup_loc;
+    Loc su1 = alloc_node(2);
+    Term tm0 = take(sup_loc + 0);
+    Term tm1 = take(sup_loc + 1);
+    set(du0 + 0, tm0);
+    set(du0 + 1, term_new(SUB, 0, 0));
+    set(du1 + 0, tm1);
+    set(du1 + 1, term_new(SUB, 0, 0));
+    set(su0 + 0, term_new(DP0, dup_lab, du0));
+    set(su0 + 1, term_new(DP0, dup_lab, du1));
+    set(su1 + 0, term_new(DP1, dup_lab, du0));
+    set(su1 + 1, term_new(DP1, dup_lab, du1));
+    sub(dup_loc + 0, term_new(SUP, sup_lab, su0));
+    sub(dup_loc + 1, term_new(SUP, sup_lab, su1));
+    return term_rem_bit(got(dup_loc + dup_num));
+  }
+}
+#360:
+// ! &L{x y} = #{a b c ...}
+// ------------------------ DUP-CTR
+// ! &L{a0 a1} = a
+// ! &L{b0 b1} = b
+// ! &L{c0 c1} = c
+// ...
+// x <- #{a0 b0 c0 ...} 
+// y <- #{a1 b1 c1 ...}
+Term reduce_dup_ctr(Term dup, Term ctr) {
+  //printf("reduce_dup_ctr "); print_term(dup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Lab dup_lab = term_lab(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  Loc ctr_loc = term_loc(ctr);
+  Lab ctr_lab = term_lab(ctr);
+  u64 ctr_ari = u12v2_y(ctr_lab);
+  //Loc ctr0    = alloc_node(ctr_ari);
+  Loc ctr0    = ctr_loc;
+  Loc ctr1    = alloc_node(ctr_ari);
+  for (u64 i = 0; i < ctr_ari; i++) {
+    Loc du0 = alloc_node(2);
+    set(du0 + 0, got(ctr_loc + i));
+    set(du0 + 1, term_new(SUB, 0, 0));
+    set(ctr0 + i, term_new(DP0, dup_lab, du0));
+    set(ctr1 + i, term_new(DP1, dup_lab, du0));
+  }
+  sub(dup_loc + 0, term_new(CTR, ctr_lab, ctr0));
+  sub(dup_loc + 1, term_new(CTR, ctr_lab, ctr1));
+  return term_rem_bit(got(dup_loc + dup_num));
+}
+#361:
+// ! &L{x y} = 123
+// --------------- DUP-W32
+// x <- 123
+// y <- 123
+Term reduce_dup_w32(Term dup, Term w32) {
+  //printf("reduce_dup_w32 "); print_term(dup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  sub(dup_loc + 0, w32);
+  sub(dup_loc + 1, w32);
+  return term_rem_bit(got(dup_loc + dup_num));
+}
+#362:
+// ! &L{x y} = @foo(a b c ...)
+// --------------------------- DUP-REF-COPY (when &L not in @foo)
+// ! &L{a0 a1} = a
+// ! &L{b0 b1} = b
+// ! &L{c0 c1} = c
+// ...
+// x <- @foo(a0 b0 c0 ...)
+// y <- @foo(a1 b1 c1 ...)
+Term reduce_dup_ref(Term dup, Term ref) {
+  //printf("reduce_dup_ref "); print_term(dup); printf("\n");
+  inc_itr();
+  Loc dup_loc = term_loc(dup);
+  Lab dup_lab = term_lab(dup);
+  Tag dup_num = term_tag(dup) == DP0 ? 0 : 1;
+  Loc ref_loc = term_loc(ref);
+  Lab ref_lab = term_lab(ref);
+  u64 ref_ari = u12v2_y(ref_lab);
+  Loc ref0    = ref_loc;
+  Loc ref1    = alloc_node(1 + ref_ari);
+  for (u64 i = 0; i < ref_ari; i++) {
+    Loc du0 = alloc_node(2);
+    set(du0 + 0, got(ref_loc + i));
+    set(du0 + 1, term_new(SUB, 0, 0));
+    set(ref0 + i, term_new(DP0, dup_lab, du0));
+    set(ref1 + i, term_new(DP1, dup_lab, du0));
+  }
+  sub(dup_loc + 0, term_new(REF, ref_lab, ref0));
+  sub(dup_loc + 1, term_new(REF, ref_lab, ref1));
+  return term_rem_bit(got(dup_loc + dup_num));
+}
+#363:
+// ~ * {K0 K1 K2 ...} 
+// ------------------ MAT-ERA
+// *
+Term reduce_mat_era(Term mat, Term era) {
+  //printf("reduce_mat_era "); print_term(mat); printf("\n");
+  inc_itr();
+  return era;
+}
+#364:
+// ~ λx(x) {K0 K1 K2 ...}
+// ---------------------- MAT-LAM
+// ⊥
+Term reduce_mat_lam(Term mat, Term lam) {
+  //printf("reduce_mat_lam "); print_term(mat); printf("\n");
+  printf("invalid:mat-lam");
+  exit(0);
+}
+#365:
+// ~ &L{x y} {K0 K1 K2 ...}
+// ------------------------ MAT-SUP
+// ! &L{k0a k0b} = K0
+// ! &L{k1a k1b} = K1
+// ! &L{k2a k2b} = K2
+// ...
+// &L{ ~ x {K0a K1a K2a ...}
+//     ~ y {K0b K1b K2b ...} }
+Term reduce_mat_sup(Term mat, Term sup) {
+  //printf("reduce_mat_sup "); print_term(mat); printf("\n");
+  inc_itr();
+  Loc mat_loc = term_loc(mat);
+  Loc sup_loc = term_loc(sup);
+  Lab sup_lab = term_lab(sup);
+  Term tm0    = got(sup_loc + 0);
+  Term tm1    = got(sup_loc + 1);
+  Lab mat_lab = term_lab(mat);
+  u64 mat_len = u12v2_x(mat_lab);
+  Loc mat1    = alloc_node(1 + mat_len);
+  //Loc mat0    = alloc_node(1 + mat_len);
+  //Loc sup0    = alloc_node(2);
+  Loc mat0    = mat_loc;
+  Loc sup0    = sup_loc;
+  set(mat0 + 0, tm0);
+  set(mat1 + 0, tm1);
+  for (u64 i = 0; i < mat_len; i++) {
+    Loc du0 = alloc_node(2);
+    set(du0 + 0, got(mat_loc + 1 + i));
+    set(du0 + 1, term_new(SUB, 0, 0));
+    set(mat0 + 1 + i, term_new(DP0, sup_lab, du0));
+    set(mat1 + 1 + i, term_new(DP1, sup_lab, du0));
+  }
+  set(sup0 + 0, term_new(MAT, mat_lab, mat0));
+  set(sup0 + 1, term_new(MAT, mat_lab, mat1));
+  return term_new(SUP, sup_lab, sup0);
+}
+#366:
+// ~ #N{x y z ...} {K0 K1 K2 ...} 
+// ------------------------------ MAT-CTR
+// (((KN x) y) z ...)
+Term reduce_mat_ctr(Term mat, Term ctr) {
+  //printf("reduce_mat_ctr "); print_term(mat); printf("\n");
+  inc_itr();
+  Loc mat_loc = term_loc(mat);
+  Lab mat_lab = term_lab(mat);
+  // If-Let
+  if (u12v2_y(mat_lab) > 0) {
+    Loc ctr_loc = term_loc(ctr);
+    Lab ctr_lab = term_lab(ctr);
+    u64 mat_ctr = u12v2_y(mat_lab) - 1;
+    u64 ctr_num = u12v2_x(ctr_lab);
+    u64 ctr_ari = u12v2_y(ctr_lab);
+    if (mat_ctr == ctr_num) {
+      Term app = got(mat_loc + 1);
+      for (u64 i = 0; i < ctr_ari; i++) {
+        Loc new_app = alloc_node(2);
+        set(new_app + 0, app);
+        set(new_app + 1, got(ctr_loc + i));
+        app = term_new(APP, 0, new_app);
+      }
+      return app;
+    } else {
+      Term app = got(mat_loc + 2);
+      Loc new_app = alloc_node(2);
+      set(new_app + 0, app);
+      set(new_app + 1, ctr);
+      app = term_new(APP, 0, new_app);
+      return app;
+    }
+  // Match
+  } else {
+    Loc ctr_loc = term_loc(ctr);
+    Lab ctr_lab = term_lab(ctr);
+    u64 ctr_num = u12v2_x(ctr_lab);
+    u64 ctr_ari = u12v2_y(ctr_lab);
+    Term app = got(mat_loc + 1 + ctr_num);
+    for (u64 i = 0; i < ctr_ari; i++) {
+      Loc new_app = alloc_node(2);
+      set(new_app + 0, app);
+      set(new_app + 1, got(ctr_loc + i));
+      app = term_new(APP, 0, new_app);
+    }
+    return app;
+  }
+}
+#367:
+// ~ num {K0 K1 K2 ... KN}
+// ----------------------- MAT-W32
+// if n < N: Kn
+// else    : KN(num-N)
+Term reduce_mat_w32(Term mat, Term w32) {
+  //printf("reduce_mat_w32 "); print_term(mat); printf("\n");
+  inc_itr();
+  Lab mat_tag = term_tag(mat);
+  Loc mat_loc = term_loc(mat);
+  Lab mat_lab = term_lab(mat);
+  u64 mat_len = u12v2_x(mat_lab);
+  u64 w32_val = term_loc(w32);
+  if (w32_val < mat_len - 1) {
+    return got(mat_loc + 1 + w32_val);
+  } else {
+    Loc app = alloc_node(2);
+    set(app + 0, got(mat_loc + mat_len));
+    set(app + 1, term_new(W32, 0, w32_val - (mat_len - 1)));
+    return term_new(APP, 0, app);
+  }
+}
+#368:
+// <op(* b)
+// -------- OPX-ERA
+// *
+Term reduce_opx_era(Term opx, Term era) {
+  //printf("reduce_opx_era "); print_term(opx); printf("\n");
+  inc_itr();
+  return era;
+}
+#369:
+// <op(λx(B) y)
+// ------------ OPX-LAM
+// ⊥
+Term reduce_opx_lam(Term opx, Term lam) {
+  //printf("reduce_opx_lam "); print_term(opx); printf("\n");
+  printf("invalid:opx-lam");
+  exit(0);
+}
+#370:
+// <op(&L{x0 x1} y)
+// ------------------------- OPX-SUP
+// ! &L{y0 y1} = y
+// &L{<op(x0 y0) <op(x1 y1)}
+Term reduce_opx_sup(Term opx, Term sup) {
+  //printf("reduce_opx_sup "); print_term(opx); printf("\n");
+  inc_itr();
+  Loc opx_loc = term_loc(opx);
+  Loc sup_loc = term_loc(sup);
+  Lab sup_lab = term_lab(sup);
+  Term nmy    = got(opx_loc + 1);
+  Term tm0    = got(sup_loc + 0);
+  Term tm1    = got(sup_loc + 1);
+  Loc du0     = alloc_node(2);
+  //Loc op0     = alloc_node(2);
+  //Loc op1     = alloc_node(2);
+  Loc op0     = opx_loc;
+  Loc op1     = sup_loc;
+  Loc su0     = alloc_node(2);
+  set(du0 + 0, nmy);
+  set(du0 + 1, term_new(SUB, 0, 0));
+  set(op0 + 0, tm0);
+  set(op0 + 1, term_new(DP0, sup_lab, du0));
+  set(op1 + 0, tm1);
+  set(op1 + 1, term_new(DP1, sup_lab, du0));
+  set(su0 + 0, term_new(OPX, term_lab(opx), op0));
+  set(su0 + 1, term_new(OPX, term_lab(opx), op1));
+  return term_new(SUP, sup_lab, su0);
+}
+#371:
+// <op(#{x0 x1 x2...} y)
+// --------------------- OPX-CTR
+// ⊥
+Term reduce_opx_ctr(Term opx, Term ctr) {
+  //printf("reduce_opx_ctr "); print_term(opx); printf("\n");
+  printf("invalid:opx-ctr");
+  exit(0);
+}
+#372:
+// <op(x0 x1)
+// ---------- OPX-W32
+// <op(x0 x1)
+Term reduce_opx_w32(Term opx, Term w32) {
+  //printf("reduce_opx_w32 "); print_term(opx); printf("\n");
+  inc_itr();
+  Lab opx_lab = term_lab(opx);
+  Lab opx_loc = term_loc(opx);
+  set(opx_loc + 0, w32);
+  return term_new(OPY, opx_lab, opx_loc);
+}
+#373:
+// >op(a *)
+// -------- OPY-ERA
+// *
+Term reduce_opy_era(Term opy, Term era) {
+  //printf("reduce_opy_era "); print_term(opy); printf("\n");
+  inc_itr();
+  return era;
+}
+#374:
+// >op(a λx(B))
+// ------------ OPY-LAM
+// *
+Term reduce_opy_lam(Term opy, Term era) {
+  //printf("reduce_opy_lam "); print_term(opy); printf("\n");
+  printf("invalid:opy-lam");
+  exit(0);
+}
+#375:
+// >op(a &L{x y})
+// --------------------- OPY-SUP
+// &L{>op(a x) >op(a y)}
+Term reduce_opy_sup(Term opy, Term sup) {
+  //printf("reduce_opy_sup "); print_term(opy); printf("\n");
+  inc_itr();
+  Loc opy_loc = term_loc(opy);
+  Loc sup_loc = term_loc(sup);
+  Lab sup_lab = term_lab(sup);
+  Term nmx    = got(opy_loc + 0);
+  Term tm0    = got(sup_loc + 0);
+  Term tm1    = got(sup_loc + 1);
+  //Loc op0     = alloc_node(2);
+  //Loc op1     = alloc_node(2);
+  Loc op0     = opy_loc;
+  Loc op1     = sup_loc;
+  Loc su0     = alloc_node(2);
+  set(op0 + 0, nmx);
+  set(op0 + 1, tm0);
+  set(op1 + 0, nmx);
+  set(op1 + 1, tm1);
+  set(su0 + 0, term_new(OPY, term_lab(opy), op0));
+  set(su0 + 1, term_new(OPY, term_lab(opy), op1));
+  return term_new(SUP, sup_lab, su0);
+}
+#376:
+// >op(#{x y z ...} b)
+// ---------------------- OPY-CTR
+// ⊥
+Term reduce_opy_ctr(Term opy, Term ctr) {
+  //printf("reduce_opy_ctr "); print_term(opy); printf("\n");
+  printf("invalid:opy-ctr");
+  exit(0);
+}
+#377:
+// >op(x y)
+// --------- OPY-W32
+// x op y
+Term reduce_opy_w32(Term opy, Term w32) {
+  //printf("reduce_opy_w32 "); print_term(opy); printf("\n");
+  inc_itr();
+  Loc opy_loc = term_loc(opy);
+  u32 t = term_tag(w32);
+  u32 x = term_loc(got(opy_loc + 0));
+  u32 y = term_loc(w32);
+  u32 result;
+  switch (term_lab(opy)) {
+    case OP_ADD: result = x + y; break;
+    case OP_SUB: result = x - y; break;
+    case OP_MUL: result = x * y; break;
+    case OP_DIV: result = x / y; break;
+    case OP_MOD: result = x % y; break;
+    case OP_EQ:  result = x == y; break;
+    case OP_NE:  result = x != y; break;
+    case OP_LT:  result = x < y; break;
+    case OP_GT:  result = x > y; break;
+    case OP_LTE: result = x <= y; break;
+    case OP_GTE: result = x >= y; break;
+    case OP_AND: result = x & y; break;
+    case OP_OR:  result = x | y; break;
+    case OP_XOR: result = x ^ y; break;
+    case OP_LSH: result = x << y; break;
+    case OP_RSH: result = x >> y; break;
+    default: result = 0;
+  }
+  return term_new(t, 0, result);
+}
+#378:
+Term reduce(Term term) {
+  if (term_tag(term) >= ERA) return term;
+  Term next = term;
+  u64  stop = *HVM.spos;
+  u64* spos = HVM.spos;
+#379:
+  while (1) {
+#380:
+    //printf("NEXT "); print_term(term); printf("\n");
+    //printf("PATH ");
+    //for (u64 i = 0; i < *spos; ++i) {
+      //print_tag(term_tag(HVM.sbuf[i]));
+      //printf(" ");
+    //}
+    //printf(" ~ %p", HVM.sbuf);
+    //printf("\n");
+    Tag tag = term_tag(next);
+    Lab lab = term_lab(next);
+    Loc loc = term_loc(next);
+#381:
+    switch (tag) {
+#382:
+      case LET: {
+        switch (lab) {
+          case LAZY: {
+            next = reduce_let(next, got(loc + 0));
+            continue;
+          }
+          case STRI: {
+            HVM.sbuf[(*spos)++] = next;
+            next = got(loc + 1);
+            continue;
+          }
+          case PARA: {
+            printf("TODO\n");
+            continue;
+          }
+        }
+      }
+#383:
+      case APP: {
+        HVM.sbuf[(*spos)++] = next;
+        next = got(loc + 0);
+        continue;
+      }
+#384:
+      case MAT: {
+        HVM.sbuf[(*spos)++] = next;
+        next = got(loc + 0);
+        continue;
+      }
+#385:
+      case OPX: {
+        HVM.sbuf[(*spos)++] = next;
+        next = got(loc + 0);
+        continue;
+      }
+#386:
+      case OPY: {
+        HVM.sbuf[(*spos)++] = next;
+        next = got(loc + 1);
+        continue;
+      }
+#387:
+      case DP0: {
+        Term sb0 = got(loc + 0);
+        if (term_get_bit(sb0) == 0) {
+          HVM.sbuf[(*spos)++] = next;
+          next = got(loc + 0);
+          continue;
+        } else {
+          next = term_rem_bit(sb0);
+          continue;
+        }
+      }
+#388:
+      case DP1: {
+        Term sb1 = got(loc + 1);
+        if (term_get_bit(sb1) == 0) {
+          HVM.sbuf[(*spos)++] = next;
+          next = got(loc + 0);
+          continue;
+        } else {
+          next = term_rem_bit(sb1);
+          continue;
+        }
+      }
+#389:
+      case VAR: {
+        Term sub = got(loc);
+        if (term_get_bit(sub) == 0) {
+          break;
+        } else {
+          next = term_rem_bit(sub);
+          continue;
+        }
+      }
+#390:
+      case REF: {
+        next = reduce_ref(next); // TODO
+        continue;
+      }
+#391:
+      default: {
+#392:
+        if ((*spos) == stop) {
+          break;
+        } else {
+          Term prev = HVM.sbuf[--(*spos)];
+          Tag  ptag = term_tag(prev);
+          Lab  plab = term_lab(prev);
+          Loc  ploc = term_loc(prev);
+          switch (ptag) {
+#393:
+            case LET: {
+              next = reduce_let(prev, next);
+              continue;
+            }
+#394:
+            case APP: {
+              switch (tag) {
+                case ERA: next = reduce_app_era(prev, next); continue;
+                case LAM: next = reduce_app_lam(prev, next); continue;
+                case SUP: next = reduce_app_sup(prev, next); continue;
+                case CTR: next = reduce_app_ctr(prev, next); continue;
+                case W32: next = reduce_app_w32(prev, next); continue;
+                case CHR: next = reduce_app_w32(prev, next); continue;
+                default: break;
+              }
+              break;
+            }
+#395:
+            case DP0:
+            case DP1: {
+              switch (tag) {
+                case ERA: next = reduce_dup_era(prev, next); continue;
+                case LAM: next = reduce_dup_lam(prev, next); continue;
+                case SUP: next = reduce_dup_sup(prev, next); continue;
+                case CTR: next = reduce_dup_ctr(prev, next); continue;
+                case W32: next = reduce_dup_w32(prev, next); continue;
+                case CHR: next = reduce_dup_w32(prev, next); continue;
+                default: break;
+              }
+              break;
+            }
+#396:
+            case MAT: {
+              switch (tag) {
+                case ERA: next = reduce_mat_era(prev, next); continue;
+                case LAM: next = reduce_mat_lam(prev, next); continue;
+                case SUP: next = reduce_mat_sup(prev, next); continue;
+                case CTR: next = reduce_mat_ctr(prev, next); continue;
+                case W32: next = reduce_mat_w32(prev, next); continue;
+                case CHR: next = reduce_mat_w32(prev, next); continue;
+                default: break;
+              }
+            }
+#397:
+            case OPX: {
+              switch (tag) {
+                case ERA: next = reduce_opx_era(prev, next); continue;
+                case LAM: next = reduce_opx_lam(prev, next); continue;
+                case SUP: next = reduce_opx_sup(prev, next); continue;
+                case CTR: next = reduce_opx_ctr(prev, next); continue;
+                case W32: next = reduce_opx_w32(prev, next); continue;
+                case CHR: next = reduce_opx_w32(prev, next); continue;
+                default: break;
+              }
+            }
+#398:
+            case OPY: {
+              switch (tag) {
+                case ERA: next = reduce_opy_era(prev, next); continue;
+                case LAM: next = reduce_opy_lam(prev, next); continue;
+                case SUP: next = reduce_opy_sup(prev, next); continue;
+                case CTR: next = reduce_opy_ctr(prev, next); continue;
+                case W32: next = reduce_opy_w32(prev, next); continue;
+                case CHR: next = reduce_opy_w32(prev, next); continue;
+                default: break;
+              }
+            }
+#399:
+            default: break;
+          }
+          break;
+        }
+      }
+    }
+#400:
+    if ((*HVM.spos) == stop) {
+      return next;
+    } else {
+      Term host = HVM.sbuf[--(*HVM.spos)];
+      Tag  htag = term_tag(host);
+      Lab  hlab = term_lab(host);
+      Loc  hloc = term_loc(host);
+      switch (htag) {
+        case APP: set(hloc + 0, next); break;
+        case DP0: set(hloc + 0, next); break;
+        case DP1: set(hloc + 0, next); break;
+        case MAT: set(hloc + 0, next); break;
+        case OPX: set(hloc + 0, next); break;
+        case OPY: set(hloc + 1, next); break;
+      }
+      *HVM.spos = stop;
+      return HVM.sbuf[stop];
+    }
+#401:
+  }
+  printf("retr: ERR\n");
+  return 0;
+}
+#402:
+Term reduce_at(Loc host) {
+  Term term = reduce(got(host));
+  set(host, term);
+  return term;
+}
+#403:
+Term normal(Term term) {
+  Term wnf = reduce(term);
+  Tag tag = term_tag(wnf);
+  Lab lab = term_lab(wnf);
+  Loc loc = term_loc(wnf);
+  switch (tag) {
+#404:
+    case LAM: {
+      Term bod = got(loc + 0);
+      bod = normal(bod);
+      set(loc + 1, bod);
+      return wnf;
+    }
+#405:
+    case APP: {
+      Term fun = got(loc + 0);
+      Term arg = got(loc + 1);
+      fun = normal(fun);
+      arg = normal(arg);
+      set(loc + 0, fun);
+      set(loc + 1, arg);
+      return wnf;
+    }
+#406:
+    case SUP: {
+      Term tm0 = got(loc + 0);
+      Term tm1 = got(loc + 1);
+      tm0 = normal(tm0);
+      tm1 = normal(tm1);
+      set(loc + 0, tm0);
+      set(loc + 1, tm1);
+      return wnf;
+    }
+#407:
+    case DP0:
+    case DP1: {
+      Term val = got(loc + 0);
+      val = normal(val);
+      set(loc + 0, val);
+      return wnf;
+    }
+#408:
+    case CTR: {
+      u64 cid = u12v2_x(lab);
+      u64 ari = u12v2_y(lab);
+      for (u64 i = 0; i < ari; i++) {
+        Term arg = got(loc + i);
+        arg = normal(arg);
+        set(loc + i, arg);
+      }
+      return wnf;
+    }
+#409:
+    case MAT: {
+      u64 mat_len = u12v2_x(lab);
+      for (u64 i = 0; i <= mat_len; i++) {
+        Term arg = got(loc + i);
+        arg = normal(arg);
+        set(loc + i, arg);
+      }
+      return wnf;
+    }
+#410:
+    default:
+      return wnf;
+#411:
+  }
+}
+#412:
+// Primitives
+// ----------
+#413:
+// Primitive: Dynamic Sup `@SUP(lab tm0 tm1)`
+// Allocates a new SUP node with given label.
+Term SUP_f(Term ref) {
+  Loc ref_loc = term_loc(ref);
+  Term lab = reduce(got(ref_loc + 0));
+  if (term_tag(lab) != W32) {
+    printf("ERROR:non-numeric-sup-label\n");
+  }
+  Term tm0 = got(ref_loc + 1);
+  Term tm1 = got(ref_loc + 2);
+  Loc  sup = alloc_node(2);
+  Term ret = term_new(SUP, term_loc(lab), sup);
+  set(sup + 0, tm0);
+  set(sup + 1, tm1);
+  return ret;
+}
+#414:
+// Primitive: Dynamic Dup `@DUP(lab val λdp0λdp1(bod))`
+// Creates a DUP node with given label.
+Term DUP_f(Term ref) {
+  Loc ref_loc = term_loc(ref);
+  Term lab = reduce(got(ref_loc + 0));
+  if (term_tag(lab) != W32) {
+    printf("ERROR:non-numeric-dup-label\n");
+  }
+  Term val = got(ref_loc + 1);
+  Term bod = got(ref_loc + 2);
+  Loc dup = alloc_node(2);
+  set(dup + 0, val);
+  set(dup + 1, term_new(SUB, 0, 0));
+  Term bod_term = got(ref_loc + 2);
+  if (term_tag(bod_term) == LAM) {
+    Loc lam1_loc = term_loc(bod_term);
+    Term lam1_bod = got(lam1_loc + 0);
+    if (term_tag(lam1_bod) == LAM) {
+      Loc lam2_loc = term_loc(lam1_bod);
+      Term lam2_bod = got(lam2_loc + 0);
+      sub(lam1_loc + 0, term_new(DP0, term_loc(lab), dup));
+      sub(lam2_loc + 0, term_new(DP1, term_loc(lab), dup));
+      *HVM.itrs += 2;
+      return lam2_bod;
+    }
+  }
+  Loc app1 = alloc_node(2);
+  set(app1 + 0, bod);
+  set(app1 + 1, term_new(DP0, term_loc(lab), dup));
+  Loc app2 = alloc_node(2);
+  set(app2 + 0, term_new(APP, 0, app1));
+  set(app2 + 1, term_new(DP1, term_loc(lab), dup));
+  return term_new(APP, 0, app2);
+#415:
+}
+#416:
+Term LOG_f(Term ref) {
+  printf("TODO: LOG_f");
+  exit(0);
+}
+#417:
+Term FRESH_f(Term ref) {
+  printf("TODO: FRESH_f");
+  exit(0);
+}
+#418:
+// Runtime Memory
+// --------------
+#419:
+void hvm_init() {
+  // FIXME: use mmap instead
+  HVM.sbuf  = malloc((1ULL << 32) * sizeof(Term));
+  HVM.spos  = malloc(sizeof(u64));
+  *HVM.spos = 0;
+  HVM.heap  = malloc((1ULL << 32) * sizeof(ATerm));
+  HVM.size  = malloc(sizeof(u64));
+  HVM.itrs  = malloc(sizeof(u64));
+  *HVM.size = 1;
+  *HVM.itrs = 0;
+  HVM.frsh  = malloc(sizeof(u64));
+  *HVM.frsh = 0x20;
+  HVM.book[SUP_F] = SUP_f;
+  HVM.book[DUP_F] = DUP_f;
+  HVM.book[LOG_F] = LOG_f;
+  HVM.book[FRESH_F] = FRESH_f;
+}
+#420:
+void hvm_free() {
+  free(HVM.sbuf);
+  free(HVM.spos);
+  free(HVM.heap);
+  free(HVM.size);
+  free(HVM.itrs);
+  free(HVM.frsh);
+}
+#421:
+State* hvm_get_state() {
+  return &HVM;
+}
+#422:
+void hvm_set_state(State* hvm) {
+  HVM.sbuf = hvm->sbuf;
+  HVM.spos = hvm->spos;
+  HVM.heap = hvm->heap;
+  HVM.size = hvm->size;
+  HVM.itrs = hvm->itrs;
+  HVM.frsh = hvm->frsh;
+  for (int i = 0; i < 4096; i++) {
+    HVM.book[i] = hvm->book[i];
+  }
+}
+#423:
+void hvm_define(u64 fid, Term (*func)()) {
+  //printf("defined %llu %p\n", fid, func);
+  HVM.book[fid] = func;
+}
+./Show.hs
+#424:
+#425:
+module HVML.Show where
+#426:
+import Control.Applicative ((<|>))
+import Control.Monad.State
+import Data.Char (chr, ord)
+import Data.Char (intToDigit)
+import Data.IORef
+import Data.List
+import Data.Word
+import HVML.Type
+import Numeric (showIntAtBase)
+import System.IO.Unsafe (unsafePerformIO)
+import qualified Data.Map.Strict as MS
+#427:
+-- Core Stringification
+-- --------------------
+#428:
+showCore :: Core -> String
+showCore = coreToString . prettyRename
+#429:
+coreToString :: Core -> String
+coreToString core =
+#430:
+  case pretty core of
+    Just str -> str
+    Nothing -> case core of
+#431:
+      Var nam ->
+        nam
+#432:
+      Era ->
+        "*"
+#433:
+      Lam vr0 bod ->
+        let bod' = coreToString bod in
+        "λ" ++ vr0 ++ " " ++ bod'
+#434:
+      App fun arg ->
+        let fun' = coreToString fun in
+        let arg' = coreToString arg in
+        "(" ++ fun' ++ " " ++ arg' ++ ")"
+#435:
+      Sup lab tm0 tm1 ->
+        let tm0' = coreToString tm0 in
+        let tm1' = coreToString tm1 in
+        "&" ++ show lab ++ "{" ++ tm0' ++ " " ++ tm1' ++ "}"
+#436:
+      Dup lab dp0 dp1 val bod ->
+        let val' = coreToString val in
+        let bod' = coreToString bod in
+        "! &" ++ show lab ++ "{" ++ dp0 ++ " " ++ dp1 ++ "} = " ++ val' ++ "\n" ++ bod'
+#437:
+      Ref nam fid arg ->
+        let arg' = intercalate " " (map coreToString arg) in
+        "@" ++ nam ++ "(" ++ arg' ++ ")"
+#438:
+      Ctr cid fds ->
+        let fds' = unwords (map coreToString fds) in
+        "#" ++ show cid ++ "{" ++ fds' ++ "}"
+#439:
+      Mat val mov css ->
+        let val' = coreToString val in
+        let mov' = concatMap (\ (k,v) -> " !" ++ k ++ "=" ++ coreToString v) mov in
+        let css' = unwords [ctr ++ "{" ++ unwords fds ++ "}:" ++ coreToString bod | (ctr, fds, bod) <- css] in
+        "(~" ++ val' ++ mov' ++ " {" ++ css' ++ "})"
+#440:
+      U32 val ->
+        show val
+#441:
+      Chr val ->
+        "'" ++ [val] ++ "'"
+#442:
+      Op2 opr nm0 nm1 ->
+        let nm0' = coreToString nm0 in
+        let nm1' = coreToString nm1 in
+        "(" ++ operToString opr ++ " " ++ nm0' ++ " " ++ nm1' ++ ")"
+#443:
+      Let mod nam val bod ->
+        if nam == "" then
+          let val' = coreToString val in
+          let bod' = coreToString bod in
+          val' ++ "\n" ++ bod'
+        else
+          let val' = coreToString val in
+          let bod' = coreToString bod in
+          "! " ++ modeToString mod ++ nam ++ " = " ++ val' ++ "\n" ++ bod'
+#444:
+operToString :: Oper -> String
+operToString OP_ADD = "+"
+operToString OP_SUB = "-"
+operToString OP_MUL = "*"
+operToString OP_DIV = "/"
+operToString OP_MOD = "%"
+operToString OP_EQ  = "=="
+operToString OP_NE  = "!="
+operToString OP_LT  = "<"
+operToString OP_GT  = ">"
+operToString OP_LTE = "<="
+operToString OP_GTE = ">="
+operToString OP_AND = "&"
+operToString OP_OR  = "|"
+operToString OP_XOR = "^"
+operToString OP_LSH = "<<"
+operToString OP_RSH = ">>"
+#445:
+modeToString LAZY = ""
+modeToString STRI = "."
+modeToString PARA = "^"
+#446:
+-- Runtime Stringification
+-- -----------------------
+#447:
+tagToString :: Tag -> String
+tagToString t = show (tagT t)
+#448:
+labToString :: Word64 -> String
+labToString loc = padLeft (showHex loc) 6 '0'
+#449:
+locToString :: Word64 -> String
+locToString loc = padLeft (showHex loc) 9 '0'
+#450:
+termToString :: Term -> String
+termToString term =
+  let tag = tagToString (termTag term)
+      lab = labToString (termLab term)
+      loc = locToString (termLoc term)
+  in "term_new(" ++ tag ++ ",0x" ++ lab ++ ",0x" ++ loc ++ ")"
+#451:
+-- Pretty Renaming
+-- ---------------
+#452:
+prettyRename :: Core -> Core
+prettyRename core = unsafePerformIO $ do
+  namesRef <- newIORef MS.empty
+  go namesRef core
+  where
+#453:
+    go namesRef core = case core of
+#454:
+      Var name -> do
+        name' <- genName namesRef name
+        return $ Var name'
+#455:
+      Lam name body -> do
+        name' <- genName namesRef name
+        body' <- go namesRef body
+        return $ Lam name' body'
+#456:
+      Let mode name val body -> do
+        name' <- genName namesRef name
+        val' <- go namesRef val
+        body' <- go namesRef body
+        return $ Let mode name' val' body'
+#457:
+      App fun arg -> do
+        fun' <- go namesRef fun
+        arg' <- go namesRef arg
+        return $ App fun' arg'
+#458:
+      Sup lab x y -> do
+        x' <- go namesRef x
+        y' <- go namesRef y
+        return $ Sup lab x' y'
+#459:
+      Dup lab x y val body -> do
+        x' <- genName namesRef x
+        y' <- genName namesRef y
+        val' <- go namesRef val
+        body' <- go namesRef body
+        return $ Dup lab x' y' val' body'
+#460:
+      Ctr cid args -> do
+        args' <- mapM (go namesRef) args
+        return $ Ctr cid args'
+#461:
+      Mat val mov css -> do
+        val' <- go namesRef val
+        mov' <- mapM (\(k,v) -> do v' <- go namesRef v; return (k,v')) mov
+        css' <- mapM (\(c,vs,t) -> do t' <- go namesRef t; return (c,vs,t')) css
+        return $ Mat val' mov' css'
+#462:
+      Op2 op x y -> do
+        x' <- go namesRef x
+        y' <- go namesRef y
+        return $ Op2 op x' y'
+#463:
+      Ref name fid args -> do
+        args' <- mapM (go namesRef) args
+        return $ Ref name fid args'
+#464:
+      other -> return other
+#465:
+    genName namesRef name = do
+      nameMap <- readIORef namesRef
+      case MS.lookup name nameMap of
+        Just name' -> return name'
+        Nothing -> do
+          let newName = genNameFromIndex (MS.size nameMap)
+          modifyIORef' namesRef (MS.insert name newName)
+          return newName
+#466:
+    genNameFromIndex n = go (n + 1) "" where
+      go n ac | n == 0    = ac
+              | otherwise = go q (chr (ord 'a' + r) : ac)
+              where (q,r) = quotRem (n - 1) 26
+#467:
+-- Pretty Printers
+-- ---------------
+#468:
+pretty :: Core -> Maybe String
+pretty core = prettyStr core <|> prettyLst core
+-- pretty core = prettyStr core
+#469:
+prettyStr :: Core -> Maybe String
+prettyStr (Ctr 0 []) = Just "\"\""
+prettyStr (Ctr 1 [Chr h, t]) = do
+  rest <- prettyStr t
+  return $ "\"" ++ h : tail rest
+prettyStr _ = Nothing
+#470:
+prettyLst :: Core -> Maybe String
+prettyLst (Ctr 0 []) = Just "[]"
+prettyLst (Ctr 1 [x, xs]) = do
+  rest <- prettyLst xs
+  return $ "[" ++ coreToString x ++ if rest == "[]" then "]" else " " ++ tail rest
+prettyLst _ = Nothing
+#471:
+-- Dumping
+-- -------
+#472:
+dumpHeapRange :: Word64 -> Word64 -> HVM [(Word64, Term)]
+dumpHeapRange ini len =
+  if ini < len then do
+    head <- got ini
+    tail <- dumpHeapRange (ini + 1) len
+    if head == 0
+      then return tail
+      else return ((ini, head) : tail)
+  else return []
+#473:
+dumpHeap :: HVM ([(Word64, Term)], Word64)
+dumpHeap = do
+  len <- getLen
+  itr <- getItr
+  terms <- dumpHeapRange 0 len
+  return (terms, itr)
+#474:
+heapToString :: ([(Word64, Term)], Word64) -> String
+heapToString (terms, itr) = 
+  "set_itr(0x" ++ padLeft (showHex itr) 9 '0' ++ ");\n" ++
+  foldr (\(k,v) txt ->
+    let addr = padLeft (showHex k) 9 '0'
+        term = termToString v
+    in "set(0x" ++ addr ++ ", " ++ term ++ ");\n" ++ txt) "" terms
+#475:
+padLeft :: String -> Int -> Char -> String
+padLeft str n c = replicate (n - length str) c ++ str
+#476:
+showHex :: Word64 -> String
+showHex x = showIntAtBase 16 intToDigit (fromIntegral x) ""
+./Type.hs
+#477:
+module HVML.Type where
+#478:
+import Data.Map.Strict as MS
+import Data.Word
+import Foreign.Ptr
+#479:
+-- Core Types
+-- ----------
+#480:
+--show--
+data Core
+  = Var String -- x
+  | Ref String Word64 [Core] -- @fn
+  | Era -- *
+  | Lam String Core -- λx(F)
+  | App Core Core -- (f x)
+  | Sup Word64 Core Core -- &L{a b}
+  | Dup Word64 String String Core Core -- ! &L{a b} = v body
+  | Ctr Word64 [Core] -- #Ctr{a b ...}
+  | Mat Core [(String,Core)] [(String,[String],Core)] -- ~ v { #A{a b ...}: ... #B{a b ...}: ... ... }
+  | U32 Word32 -- 123
+  | Chr Char -- 'a'
+  | Op2 Oper Core Core -- (+ a b)
+  | Let Mode String Core Core -- ! x = v body
+  deriving (Show, Eq)
+#481:
+--show--
+data Mode
+  = LAZY
+  | STRI
+  | PARA
+  deriving (Show, Eq, Enum)
+#482:
+--show--
+data Oper
+  = OP_ADD | OP_SUB | OP_MUL | OP_DIV
+  | OP_MOD | OP_EQ  | OP_NE  | OP_LT
+  | OP_GT  | OP_LTE | OP_GTE | OP_AND
+  | OP_OR  | OP_XOR | OP_LSH | OP_RSH
+  deriving (Show, Eq, Enum)
+#483:
+--show--
+-- A top-level function, including:
+-- - copy: true when ref-copy mode is enabled
+-- - args: a list of (isArgStrict, argName) pairs
+-- - core: the function's body
+-- Note: ref-copy improves C speed, but increases interaction count
+type Func = ((Bool, [(Bool,String)]), Core)
+#484:
+--show--
+-- NOTE: the new idToLabs field is a map from a function id to a set of all
+-- DUP/SUP labels used in its body. note that, when a function uses either
+-- HVM.SUP or HVM.DUP internally, this field is set to Nothing. this will be
+-- used to apply the fast DUP-REF and REF-SUP interactions, when safe to do so
+data Book = Book
+  { idToFunc :: MS.Map Word64 Func
+  , idToName :: MS.Map Word64 String
+  , idToLabs :: MS.Map Word64 (MS.Map Word64 ())
+  , nameToId :: MS.Map String Word64
+  , ctrToAri :: MS.Map String Int
+  , ctrToCid :: MS.Map String Word64
+  } deriving (Show, Eq)
+#485:
+-- Runtime Types
+-- -------------
+#486:
+--show--
+type Tag  = Word64
+type Lab  = Word64
+type Loc  = Word64
+type Term = Word64
+#487:
+--show--
+data TAG
+  = DP0
+  | DP1
+  | VAR
+  | ERA
+  | APP
+  | LAM
+  | SUP
+  | SUB
+  | REF
+  | LET
+  | CTR
+  | MAT
+  | W32
+  | CHR
+  | OPX
+  | OPY
+  deriving (Eq, Show)
+#488:
+--show--
+type HVM = IO
+#489:
+--show--
+type ReduceAt = Book -> Loc -> HVM Term
+#490:
+-- C Functions
+-- -----------
+#491:
+foreign import ccall unsafe "Runtime.c hvm_init"
+  hvmInit :: IO ()
+foreign import ccall unsafe "Runtime.c hvm_free"
+  hvmFree :: IO ()
+foreign import ccall unsafe "Runtime.c alloc_node"
+  allocNode :: Word64 -> IO Word64
+foreign import ccall unsafe "Runtime.c set"
+  set :: Word64 -> Term -> IO ()
+foreign import ccall unsafe "Runtime.c got"
+  got :: Word64 -> IO Term
+foreign import ccall unsafe "Runtime.c take"
+  take :: Word64 -> IO Term
+foreign import ccall unsafe "Runtime.c swap"
+  swap :: Word64 -> IO Term
+foreign import ccall unsafe "Runtime.c term_new"
+  termNew :: Tag -> Lab -> Loc -> Term
+foreign import ccall unsafe "Runtime.c term_tag"
+  termTag :: Term -> Tag
+foreign import ccall unsafe "Runtime.c term_get_bit"
+  termGetBit :: Term -> Tag
+foreign import ccall unsafe "Runtime.c term_lab"
+  termLab :: Term -> Lab
+foreign import ccall unsafe "Runtime.c term_loc"
+  termLoc :: Term -> Loc
+foreign import ccall unsafe "Runtime.c term_set_bit"
+  termSetBit :: Term -> Tag
+foreign import ccall unsafe "Runtime.c term_rem_bit"
+  termRemBit :: Term -> Tag
+foreign import ccall unsafe "Runtime.c get_len"
+  getLen :: IO Word64
+foreign import ccall unsafe "Runtime.c get_itr"
+  getItr :: IO Word64
+foreign import ccall unsafe "Runtime.c inc_itr"
+  incItr :: IO Word64
+foreign import ccall unsafe "Runtime.c fresh"
+  fresh :: IO Word64
+foreign import ccall unsafe "Runtime.c reduce"
+  reduceC :: Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_let"
+  reduceLet :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_app_era"
+  reduceAppEra :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_app_lam"
+  reduceAppLam :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_app_sup"
+  reduceAppSup :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_app_ctr"
+  reduceAppCtr :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_app_w32"
+  reduceAppW32 :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_era"
+  reduceDupEra :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_lam"
+  reduceDupLam :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_sup"
+  reduceDupSup :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_ctr"
+  reduceDupCtr :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_w32"
+  reduceDupW32 :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_dup_ref"
+  reduceDupRef :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_mat_era"
+  reduceMatEra :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_mat_lam"
+  reduceMatLam :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_mat_sup"
+  reduceMatSup :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_mat_ctr"
+  reduceMatCtr :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_mat_w32"
+  reduceMatW32 :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opx_era"
+  reduceOpxEra :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opx_lam"
+  reduceOpxLam :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opx_sup"
+  reduceOpxSup :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opx_ctr"
+  reduceOpxCtr :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opx_w32"
+  reduceOpxW32 :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opy_era"
+  reduceOpyEra :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opy_lam"
+  reduceOpyLam :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opy_sup"
+  reduceOpySup :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opy_ctr"
+  reduceOpyCtr :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_opy_w32"
+  reduceOpyW32 :: Term -> Term -> IO Term
+foreign import ccall unsafe "Runtime.c reduce_ref_sup"
+  reduceRefSup :: Term -> Word64 -> IO Term
+foreign import ccall unsafe "Runtime.c hvm_define"
+  hvmDefine :: Word64 -> FunPtr (IO Term) -> IO ()
+foreign import ccall unsafe "Runtime.c hvm_get_state"
+  hvmGetState :: IO (Ptr ())
+foreign import ccall unsafe "Runtime.c hvm_set_state"
+  hvmSetState :: Ptr () -> IO ()
+foreign import ccall unsafe "Runtime.c u12v2_new"
+  u12v2New :: Word64 -> Word64 -> Word64
+foreign import ccall unsafe "Runtime.c u12v2_x"
+  u12v2X :: Word64 -> Word64
+foreign import ccall unsafe "Runtime.c u12v2_y"
+  u12v2Y :: Word64 -> Word64
+#492:
+-- Constants
+-- ---------
+#493:
+--show--
+tagT :: Tag -> TAG
+tagT 0x00 = DP0
+tagT 0x01 = DP1
+tagT 0x02 = VAR
+tagT 0x03 = SUB
+tagT 0x04 = REF
+tagT 0x05 = LET
+tagT 0x06 = APP
+tagT 0x08 = MAT
+tagT 0x09 = OPX
+tagT 0x0A = OPY
+tagT 0x0B = ERA
+tagT 0x0C = LAM
+tagT 0x0D = SUP
+tagT 0x0F = CTR
+tagT 0x10 = W32
+tagT 0x11 = CHR
+tagT tag  = error $ "unknown tag: " ++ show tag
+#494:
+_DP0_ :: Tag
+_DP0_ = 0x00
+#495:
+_DP1_ :: Tag
+_DP1_ = 0x01
+#496:
+_VAR_ :: Tag
+_VAR_ = 0x02
+#497:
+_SUB_ :: Tag
+_SUB_ = 0x03
+#498:
+_REF_ :: Tag
+_REF_ = 0x04
+#499:
+_LET_ :: Tag
+_LET_ = 0x05
+#500:
+_APP_ :: Tag
+_APP_ = 0x06
+#501:
+_MAT_ :: Tag
+_MAT_ = 0x08
+#502:
+_OPX_ :: Tag
+_OPX_ = 0x09
+#503:
+_OPY_ :: Tag
+_OPY_ = 0x0A
+#504:
+_ERA_ :: Tag
+_ERA_ = 0x0B
+#505:
+_LAM_ :: Tag
+_LAM_ = 0x0C
+#506:
+_SUP_ :: Tag
+_SUP_ = 0x0D
+#507:
+_CTR_ :: Tag
+_CTR_ = 0x0F
+#508:
+_W32_ :: Tag
+_W32_ = 0x10
+#509:
+_CHR_ :: Tag
+_CHR_ = 0x11
+#510:
+--show--
+modeT :: Lab -> Mode
+modeT 0x00 = LAZY
+modeT 0x01 = STRI
+modeT 0x02 = PARA
+modeT mode = error $ "unknown mode: " ++ show mode
+#511:
+-- Primitive Functions
+_DUP_F_ :: Lab
+_DUP_F_ = 0xFFF
+#512:
+_SUP_F_ :: Lab
+_SUP_F_ = 0xFFE
+#513:
+_LOG_F_ :: Lab
+_LOG_F_ = 0xFFD
+#514:
+_FRESH_F_ :: Lab
+_FRESH_F_ = 0xFFC
+#515:
+primitives :: [(String, Lab)]
+primitives = 
+  [ ("SUP", _SUP_F_)
+  , ("DUP", _DUP_F_)
+  , ("LOG", _LOG_F_)
+  , ("FRESH", _FRESH_F_)
+  ]
+#516:
+-- Utils
+-- -----
+#517:
+-- Getter function for maps
+mget map key =
+  case MS.lookup key map of
+    Just val -> val
+    Nothing  -> error $ "key not found: " ++ show key
+#518:
+-- The if-let match stores its target ctr id
+ifLetLab :: Book -> Core -> Word64
+ifLetLab book (Mat _ _ [(ctr,_,_),("_",_,_)]) =
+  case MS.lookup ctr (ctrToCid book) of
+    Just cid -> 1 + cid
+    Nothing  -> 0
+ifLetLab book _ = 0
