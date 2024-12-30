@@ -1,4 +1,4 @@
-# HVM3 Bounty Submissions
+# HVM3 Bounty Submission
 
 This tool analyzes HVM3 code blocks to identify portions that need refactoring based on a specified task. It uses the Deepseek API to analyze code blocks and determines which blocks require modification.
 
